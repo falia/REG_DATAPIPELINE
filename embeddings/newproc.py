@@ -647,10 +647,10 @@ def main():
     os.environ.setdefault("CSSF_MAX_CACHE_GB", "200")
 
     MILVUS_CONFIG = {
-        "host": "34.241.177.15",
+        "host": "54.217.166.223",
         "port": "19530",
         "collection_name": "cssf_documents_final_final_CGDEMO40",
-        "connection_args": {"host": "34.241.177.15", "port": "19530"},
+        "connection_args": {"host": "54.217.166.223", "port": "19530"},
     }
 
     processor = S3MetadataProcessor(
