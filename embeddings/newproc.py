@@ -301,7 +301,7 @@ class S3MetadataProcessor:
                 Config=self.transfer_config,
             )
             # print only when actually downloaded
-            print(f"Downloaded: {self._filename_from_url_or_key(original_url, key, dst_path)}")
+            #print(f"Downloaded: {self._filename_from_url_or_key(original_url, key, dst_path)}")
             return (dst_path, True)
         except OSError as oe:
             if getattr(oe, "errno", None) == errno.ENOSPC:
@@ -611,7 +611,7 @@ def main():
     MILVUS_CONFIG = {
         "host": "34.241.177.15",
         "port": "19530",
-        "collection_name": "cssf_documents_final_final_CGDEMO6",
+        "collection_name": "cssf_documents_final_final_CGDEMO7",
         "connection_args": {"host": "34.241.177.15", "port": "19530"},
     }
 
