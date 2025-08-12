@@ -8,6 +8,8 @@ import boto3
 import hashlib
 import logging
 import threading
+import shutil
+import errno
 from typing import List, Dict, Any, Optional, Iterable, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
@@ -21,7 +23,6 @@ from embeddings.chunker.document_chunker import DocumentChunker
 from embeddings.parsers.parser import EurlexHTMLParser, CSSFHTMLParser, PDFParserPipeline, DocumentProcessor
 
 
-# --- only the fields you said you want (plus vector/text/doc_id used by the store) ---
 ALLOWED_FIELDS = {
     "text", "vector", "doc_id",
     "url", "title", "subtitle", "document_type", "document_number",
@@ -39,33 +40,28 @@ def _ensure_dir(p: str) -> None:
 _INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
 
 def _safe_segment(text: str, maxlen: int = 120) -> str:
-    """Sanitize a single path segment for Windows compatibility and cap length."""
     if text is None:
         text = ""
     s = str(text)
-    s = _INVALID_CHARS.sub("_", s)          # replace invalid chars
-    s = re.sub(r"\s+", " ", s)              # collapse whitespace
-    s = s.strip(" .")                       # no trailing dots/spaces
+    s = _INVALID_CHARS.sub("_", s)
+    s = re.sub(r"\s+", " ", s)
+    s = s.strip(" .")
     if not s:
         s = "_"
     if len(s) > maxlen:
-        # keep a recognizable prefix; suffix with short hash to avoid collisions
         h = hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
         s = f"{s[:maxlen-13]}_{h}"
-    # avoid Windows reserved device names (CON, PRN, AUX, NUL, COM1.., LPT1..)
     reserved = {"CON","PRN","AUX","NUL"} | {f"COM{i}" for i in range(1,10)} | {f"LPT{i}" for i in range(1,10)}
     if s.upper() in reserved:
         s = f"_{s}_"
     return s
 
-def _safe_hash_token(data: str, length: int = 32) -> str:
+def _safe_hash_token(data: str, length: int = 40) -> str:
     return hashlib.sha256(data.encode("utf-8")).hexdigest()[:length]
 
 def _win_long_path(path: str) -> str:
-    """Prefix with \\?\ on Windows when needed to bypass MAX_PATH issues."""
     if os.name == "nt":
         if not path.startswith("\\\\?\\"):
-            # Only use for absolute paths
             abs_path = os.path.abspath(path)
             if len(abs_path) >= 240:
                 return "\\\\?\\" + abs_path
@@ -73,35 +69,22 @@ def _win_long_path(path: str) -> str:
     return path
 
 def _safe_local_rel_from_key(s3_key: str) -> str:
-    """
-    Create a Windows-safe, not-too-deep relative path from an S3 key.
-    We keep the first two segments (usually: session + slug) as sanitized folders
-    and collapse the rest (often a long base64/URL-ish tail) into a short hash filename.
-    """
     parts = [p for p in s3_key.split("/") if p not in ("", ".", "..")]
-
     if not parts:
         return _safe_segment("file")
-
-    # Take up to first 2 segments as folders (session / slug)
     head = parts[:2]
     tail = "/".join(parts[2:]) if len(parts) > 2 else parts[-1]
-
     safe_head = [_safe_segment(p) for p in head]
-    # File leaf becomes a stable hash, with a tiny human hint if possible
     hint = _safe_segment(head[1] if len(head) > 1 else parts[0], 40)
     leaf = f"{hint}__{_safe_hash_token(tail, 40)}"
-
     rel_path = os.path.join(*safe_head, leaf) if safe_head else leaf
     return rel_path
 
 
 def _parse_s3_uri(s3_uri: str) -> Tuple[str, str]:
-    # returns (bucket, key)
     if s3_uri.startswith("s3://"):
         u = urlparse(s3_uri)
         return u.netloc, u.path.lstrip("/")
-    # fallback: allow raw keys
     return "", s3_uri
 
 
@@ -117,6 +100,7 @@ class S3MetadataProcessor:
         multipart_chunksize_mb: int = 64,
         region_name: Optional[str] = None,
         batch_store_size: int = 256,
+        transfer_threads_per_download: int = 8,
     ):
         self.s3_bucket = s3_bucket
         self.session_id = session_id
@@ -124,6 +108,7 @@ class S3MetadataProcessor:
         self.max_workers = max_workers
         self.download_max_workers = download_max_workers
         self.batch_store_size = batch_store_size
+        self.transfer_threads = transfer_threads_per_download
 
         session = boto3.session.Session(region_name=region_name)
         self.s3 = session.client("s3")
@@ -131,18 +116,18 @@ class S3MetadataProcessor:
         self.transfer_config = TransferConfig(
             multipart_threshold=multipart_chunksize_mb * 1024 * 1024,
             multipart_chunksize=multipart_chunksize_mb * 1024 * 1024,
-            max_concurrency=self.download_max_workers,
+            max_concurrency=self.transfer_threads,
             use_threads=True,
         )
 
         self.processor = DocumentProcessor(parsers=[EurlexHTMLParser(), CSSFHTMLParser(), PDFParserPipeline()])
         self.chunker = DocumentChunker(max_chunk_size=1800, overlap=200)
 
-        # dedupe structures (thread-safe)
         self.seen_hashes: set[str] = set()
         self._seen_lock = threading.Lock()
 
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        # Silence all logs by default (only our explicit prints will show)
+        logging.basicConfig(level=logging.CRITICAL, format="%(asctime)s %(levelname)s %(message)s")
         self.logger = logging.getLogger(__name__)
 
         if milvus_config is None:
@@ -160,6 +145,10 @@ class S3MetadataProcessor:
             region_name=region_name or "eu-west-1",
         )
 
+        # Disk space policy (env-overridable)
+        self.min_free_bytes = int(float(os.getenv("CSSF_MIN_FREE_MB", "8192")) * 1024 * 1024)
+        self.max_cache_bytes = int(float(os.getenv("CSSF_MAX_CACHE_GB", "200")) * 1024 * 1024 * 1024)
+
     # ---------------- util ----------------
 
     def list_sessions(self) -> List[str]:
@@ -168,18 +157,14 @@ class S3MetadataProcessor:
             sessions = [p["Prefix"].rstrip("/") for p in resp.get("CommonPrefixes", [])]
             sessions.sort(reverse=True)
             return sessions
-        except Exception as e:
-            self.logger.error(f"Error listing sessions: {e}", exc_info=True)
+        except Exception:
             return []
 
     def get_most_recent_session(self) -> Optional[str]:
         sessions = self.list_sessions()
         if not sessions:
-            self.logger.warning("No sessions found")
             return None
-        most_recent = sessions[0]
-        self.logger.info(f"Most recent session: {most_recent}")
-        return most_recent
+        return sessions[0]
 
     def get_session_metadata_files(self, session_id: str) -> List[str]:
         try:
@@ -191,25 +176,93 @@ class S3MetadataProcessor:
                     if obj["Key"].endswith("metadata.json"):
                         out.append(obj["Key"])
             return out
-        except Exception as e:
-            self.logger.error(f"Error listing metadata files for session {session_id}: {e}", exc_info=True)
+        except Exception:
             return []
 
     def read_metadata_from_s3(self, s3_key: str) -> Dict[str, Any]:
         try:
             resp = self.s3.get_object(Bucket=self.s3_bucket, Key=s3_key)
             return json.loads(resp["Body"].read().decode("utf-8"))
-        except Exception as e:
-            self.logger.error(f"Error reading metadata {s3_key}: {e}", exc_info=True)
+        except Exception:
             return {}
+
+    # ---------------- disk space helpers ----------------
+
+    def _cache_dir(self) -> str:
+        return os.path.join(self.local_cache_dir, "objects")
+
+    def _bytes_free(self, path: str) -> int:
+        try:
+            total, used, free = shutil.disk_usage(os.path.abspath(path))
+            return free
+        except Exception:
+            return 0
+
+    def _cache_size(self) -> int:
+        root = self._cache_dir()
+        total = 0
+        for base, _, files in os.walk(root):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(base, f))
+                except Exception:
+                    pass
+        return total
+
+    def _evict_cache(self, target_free_bytes: int) -> None:
+        root = self._cache_dir()
+        entries = []
+        for base, _, files in os.walk(root):
+            for f in files:
+                p = os.path.join(base, f)
+                try:
+                    st = os.stat(p)
+                    entries.append((st.st_mtime, st.st_size, p))
+                except Exception:
+                    pass
+        entries.sort()
+        freed = 0
+        for _, sz, p in entries:
+            try:
+                os.remove(p)
+                freed += sz
+                try:
+                    os.removedirs(os.path.dirname(p))
+                except Exception:
+                    pass
+                if self._bytes_free(root) >= target_free_bytes:
+                    break
+            except Exception:
+                pass
+
+    def _ensure_space_for(self, expected_bytes: int) -> None:
+        root = self._cache_dir()
+        _ensure_dir(root)
+        free_now = self._bytes_free(root)
+        cache_sz = self._cache_size()
+        if cache_sz > self.max_cache_bytes:
+            self._evict_cache(self.min_free_bytes + expected_bytes)
+            return
+        need = max(self.min_free_bytes + expected_bytes - free_now, 0)
+        if need > 0:
+            self._evict_cache(self.min_free_bytes + expected_bytes)
 
     # ---------------- local cache (pre-download) ----------------
 
     def _download_one(self, bucket: str, key: str, dst_path: str) -> Tuple[str, bool]:
         _ensure_dir(os.path.dirname(dst_path))
-        # quick skip if present (simple heuristic; for correctness you could check ETag in future)
         if os.path.exists(dst_path) and os.path.getsize(dst_path) > 0:
             return (dst_path, False)
+
+        expected = 64 * 1024 * 1024
+        try:
+            head = self.s3.head_object(Bucket=bucket, Key=key)
+            expected = int(head.get("ContentLength") or expected)
+        except Exception:
+            pass
+
+        self._ensure_space_for(expected)
+
         try:
             dst_for_api = _win_long_path(dst_path)
             self.s3.download_file(
@@ -219,17 +272,29 @@ class S3MetadataProcessor:
                 Config=self.transfer_config,
             )
             return (dst_path, True)
-        except Exception as e:
-            self.logger.error(f"Download failed: s3://{bucket}/{key} -> {dst_path}: {e}")
+        except OSError as oe:
+            if getattr(oe, "errno", None) == errno.ENOSPC:
+                self._evict_cache(self.min_free_bytes + expected)
+                try:
+                    dst_for_api = _win_long_path(dst_path)
+                    self.s3.download_file(
+                        Bucket=bucket,
+                        Key=key,
+                        Filename=dst_for_api,
+                        Config=self.transfer_config,
+                    )
+                    return (dst_path, True)
+                except Exception:
+                    return (dst_path, False)
+            else:
+                return (dst_path, False)
+        except Exception:
             return (dst_path, False)
 
     def collect_all_s3_uris_for_session(self, session_id: str) -> List[str]:
-        """Reads all metadata.json files (in parallel) and extracts every 'top_related[].s3_uri'."""
         keys = self.get_session_metadata_files(session_id)
         if not keys:
             return []
-        self.logger.info(f"Found {len(keys)} metadata files for session {session_id}")
-
         uris: set[str] = set()
         with ThreadPoolExecutor(max_workers=min(32, self.max_workers * 2)) as ex:
             futures = {ex.submit(self.read_metadata_from_s3, k): k for k in keys}
@@ -239,47 +304,29 @@ class S3MetadataProcessor:
                     s3_uri = fi.get("s3_uri")
                     if s3_uri:
                         uris.add(s3_uri)
-
-        all_uris = sorted(uris)
-        self.logger.info(f"Collected {len(all_uris)} files to download for session {session_id}")
-        return all_uris
+        return sorted(uris)
 
     def pre_download_session_files(self, session_id: str) -> Dict[str, str]:
-        """
-        Download ALL referenced S3 objects for the session into the local cache directory.
-        Returns a mapping { s3_uri -> local_path }.
-        """
-        t0 = time.time()
         uris = self.collect_all_s3_uris_for_session(session_id)
         if not uris:
             return {}
-
-        # some s3_uri may not include bucket; assume current bucket if missing
-        plan: List[Tuple[str, str, str, str]] = []  # (s3_uri, bucket, key, local_path)
+        plan: List[Tuple[str, str, str, str]] = []
         for u in uris:
             b, k = _parse_s3_uri(u)
             if not b:
                 b = self.s3_bucket
-
-            # Build a Windows-safe relative path that doesn't explode depth/length
             local_rel = _safe_local_rel_from_key(k)
             local_path = os.path.join(self.local_cache_dir, "objects", local_rel)
             plan.append((u, b, k, local_path))
 
-        # parallel download
-        downloaded = 0
         with ThreadPoolExecutor(max_workers=self.download_max_workers) as ex:
             futures = [ex.submit(self._download_one, b, k, lp) for (_u, b, k, lp) in plan]
-            for fut in as_completed(futures):
-                _path, did = fut.result()
-                downloaded += 1 if did else 0
-
-        elapsed = time.time() - t0
-        self.logger.info(f"Pre-download complete: {downloaded}/{len(plan)} fetched in {elapsed:.1f}s (~{len(plan)} total)")
+            for _ in as_completed(futures):
+                pass
 
         return {u: lp for (u, _b, _k, lp) in plan}
 
-    # ---------------- metadata shaping (ONLY your fields + page_number) ----------------
+    # ---------------- metadata shaping ----------------
 
     @staticmethod
     def _clamp(s: Any, n: int) -> str:
@@ -359,12 +406,30 @@ class S3MetadataProcessor:
         try:
             with open(_win_long_path(local_path), "rb") as f:
                 return f.read()
-        except Exception as e:
-            self.logger.error(f"Error reading local file {local_path}: {e}")
+        except Exception:
             return b""
 
+    def _filename_from_url_or_path(self, original_url: Optional[str], local_path: str) -> str:
+        # Try URL path
+        if original_url:
+            try:
+                u = urlparse(original_url)
+                name = os.path.basename(u.path.rstrip("/"))
+                if name:
+                    return name
+                # fallback to last non-empty segment
+                parts = [p for p in u.path.split("/") if p]
+                if parts:
+                    return parts[-1]
+                if u.netloc:
+                    return u.netloc
+            except Exception:
+                pass
+        # Fallback to local filename
+        base = os.path.basename(local_path)
+        return base or "document"
+
     def process_document(self, metadata: Dict[str, Any], local_map: Dict[str, str]) -> List[Document]:
-        """Parse every referenced *local* file, chunk, and attach only your fields."""
         all_docs: List[Document] = []
 
         for file_info in metadata.get("top_related", []):
@@ -377,18 +442,18 @@ class S3MetadataProcessor:
 
                 local_path = local_map.get(s3_uri)
                 if not local_path or not os.path.exists(local_path):
-                    # also try with implicit bucket (if s3_uri lacked it)
                     if not local_path:
                         bkt, key = _parse_s3_uri(s3_uri)
                         if not bkt:
-                            # build implicit-URI using default bucket
                             implicit = f"s3://{self.s3_bucket}/{key}"
                             local_path = local_map.get(implicit)
                 if not local_path or not os.path.exists(local_path):
-                    self.logger.warning(f"Local copy missing for {s3_uri} (skipping)")
                     continue
 
-                self.logger.info(f"Processing document: {original_url}")
+                # >>> Minimal output: print only the filename being processed
+                fname = self._filename_from_url_or_path(original_url, local_path)
+                print(f"Processing: {fname}")
+
                 content = self._read_local_bytes(local_path)
                 if not content:
                     continue
@@ -401,8 +466,9 @@ class S3MetadataProcessor:
                     d.metadata = self.flatten_metadata_for_search(metadata, page_number=pn)
                 all_docs.extend(chunked_docs)
 
-            except Exception as e:
-                self.logger.error(f"Error processing document {file_info.get('url','unknown')}: {e}", exc_info=True)
+            except Exception:
+                # fully silent on errors per request
+                pass
 
         return all_docs
 
@@ -417,7 +483,6 @@ class S3MetadataProcessor:
         for d in documents:
             meta = self._ensure_required_fields(self._filter_to_schema(dict(d.metadata or {})), d.page_content)
 
-            # dedupe across threads
             doc_hash = self.hash_document(Document(page_content=d.page_content, metadata=meta))
             with self._seen_lock:
                 if doc_hash in self.seen_hashes:
@@ -439,7 +504,6 @@ class S3MetadataProcessor:
             total_count += cnt
             all_ids.extend(ids)
 
-        self.logger.info(f"Stored {total_count} new documents in Milvus")
         return {"count": total_count, "milvus_ids": all_ids}
 
     def _flush_batch(self, docs: List[Document]) -> Tuple[int, List[Any]]:
@@ -448,24 +512,12 @@ class S3MetadataProcessor:
             metas = [d.metadata for d in docs]
             result = self.embedding_service.add_texts_to_store(texts=texts, metadatas=metas)
             return result.get("count", len(docs)), result.get("milvus_ids", [])
-        except Exception as e:
-            self.logger.error(f"Failed to store batch in Milvus: {e}", exc_info=True)
+        except Exception:
             return (0, [])
 
     def process_session(self, session_id: str) -> Dict[str, Any]:
-        self.logger.info(f"Processing session: {session_id}")
-
-        # 1) Pre-download everything referenced for this session
         local_map = self.pre_download_session_files(session_id)
-        if not local_map:
-            self.logger.warning(f"No files downloaded for session {session_id}")
-        else:
-            self.logger.info(f"Local cache at {self.local_cache_dir}")
-
-        # 2) Process all metadata files in parallel
         keys = self.get_session_metadata_files(session_id)
-        self.logger.info(f"Metadata files to process: {len(keys)}")
-
         if not keys:
             return {"session_id": session_id, "processed": 0, "stored": 0, "errors": 0}
 
@@ -489,37 +541,41 @@ class S3MetadataProcessor:
             for fut in as_completed(futures):
                 k, n, docs, err = fut.result()
                 if err:
-                    self.logger.error(f"Error processing {k}: {err}")
                     total_errors += 1
                 else:
-                    self.logger.info(f"Processed {k}: {n} chunks")
                     total_processed += n
-                    # append docs (safe: we only extend in main thread)
                     all_docs.extend(docs)
 
-        # 3) Store (batched) — single-threaded to keep Milvus/embeddings happy
         res = self.store_documents_in_milvus(all_docs)
-        summary = {
+        return {
             "session_id": session_id,
             "processed": total_processed,
             "stored": res.get("count", 0),
             "errors": total_errors,
         }
-        self.logger.info(f"Session {session_id} complete: {summary}")
-        return summary
 
     def process_latest_session(self) -> Dict[str, Any]:
         latest = self.get_most_recent_session()
         if not latest:
-            self.logger.warning("No sessions found")
             return {"processed": 0, "stored": 0, "errors": 0}
         return self.process_session(latest)
 
 
 def main():
     S3_BUCKET = os.getenv("CSSF_S3_BUCKET", "cssf-crawl")
-    SESSION_ID = os.getenv("CSSF_SESSION_ID")  # optional; when None we pick most recent
+    SESSION_ID = os.getenv("CSSF_SESSION_ID")
     REGION = os.getenv("AWS_REGION", "eu-west-1")
+
+    # m7i.16xlarge tuned defaults (env-overridable)
+    DL_WORKERS = int(os.getenv("CSSF_DL_WORKERS", "192"))
+    MAX_WORKERS = int(os.getenv("CSSF_MAX_WORKERS", "48"))
+    CHUNK_MB = int(os.getenv("CSSF_CHUNK_MB", "64"))
+    TRANSFER_THREADS = int(os.getenv("CSSF_TRANSFER_THREADS", "8"))
+    BATCH_STORE = int(os.getenv("CSSF_BATCH_STORE", "1024"))
+    LOCAL_CACHE = os.getenv("CSSF_LOCAL_CACHE", "./_cache/cssf_session")
+
+    os.environ.setdefault("CSSF_MIN_FREE_MB", "8192")
+    os.environ.setdefault("CSSF_MAX_CACHE_GB", "200")
 
     MILVUS_CONFIG = {
         "host": "34.241.177.15",
@@ -532,24 +588,19 @@ def main():
         s3_bucket=S3_BUCKET,
         session_id=SESSION_ID,
         milvus_config=MILVUS_CONFIG,
-        local_cache_dir=os.getenv("CSSF_LOCAL_CACHE", "./_cache/cssf_session"),
-        max_workers=int(os.getenv("CSSF_MAX_WORKERS", "12")),
-        download_max_workers=int(os.getenv("CSSF_DL_WORKERS", "16")),
-        multipart_chunksize_mb=int(os.getenv("CSSF_CHUNK_MB", "64")),
+        local_cache_dir=LOCAL_CACHE,
+        max_workers=MAX_WORKERS,
+        download_max_workers=DL_WORKERS,
+        multipart_chunksize_mb=CHUNK_MB,
         region_name=REGION,
-        batch_store_size=int(os.getenv("CSSF_BATCH_STORE", "256")),
+        batch_store_size=BATCH_STORE,
+        transfer_threads_per_download=TRANSFER_THREADS,
     )
 
-    sessions = processor.list_sessions()
-    print(f"Available sessions: {sessions}")
-
+    # Minimal stdout: no session listing or summaries
     target_session = SESSION_ID or processor.get_most_recent_session()
     if target_session:
-        print(f"Processing session: {target_session}")
-        result = processor.process_session(target_session)
-        print(f"Processing complete: {result}")
-    else:
-        print("No sessions found to process")
+        processor.process_session(target_session)
 
 
 if __name__ == "__main__":
