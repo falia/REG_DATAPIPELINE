@@ -14,7 +14,7 @@ from typing import List, Dict, Any, Optional, Iterable, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 from collections import defaultdict
-from queue import Queue, Empty
+from queue import Queue
 
 from boto3.s3.transfer import TransferConfig
 
@@ -271,7 +271,6 @@ class S3MetadataProcessor:
                     return u.netloc
             except Exception:
                 pass
-        # Fallback to S3 key leaf, else local path
         base = os.path.basename(key) or (os.path.basename(local_path) if local_path else "")
         return base or "document"
 
@@ -300,8 +299,7 @@ class S3MetadataProcessor:
                 Filename=dst_for_api,
                 Config=self.transfer_config,
             )
-            # print only when actually downloaded
-            #print(f"Downloaded: {self._filename_from_url_or_key(original_url, key, dst_path)}")
+            print(f"Downloaded: {self._filename_from_url_or_key(original_url, key, dst_path)}")
             return (dst_path, True)
         except OSError as oe:
             if getattr(oe, "errno", None) == errno.ENOSPC:
@@ -324,13 +322,14 @@ class S3MetadataProcessor:
             return (dst_path, False)
 
     def _process_one_file(self, metadata: Dict[str, Any], original_url: str, content_type: str, local_path: str) -> List[Document]:
-        """Parse one local file and return chunked Documents with flattened metadata. Prints 'Processing:'."""
-        # Minimal output: print only once per file
+        """Parse one local file and return chunked Documents with flattened metadata. Prints content type."""
         fname = self._filename_from_url_or_key(original_url, key=os.path.basename(local_path), local_path=local_path)
         ct = (content_type or "application/octet-stream").split(";")[0].strip()
+        print(f"Processing: {fname} [{ct}]")
 
         content = self._read_local_bytes(local_path)
         if not content:
+            print(f"Processed: {fname} [{ct}]")
             return []
 
         elements = self.processor.process(content, original_url, content_type)
@@ -341,7 +340,7 @@ class S3MetadataProcessor:
             pn = self._extract_page_number(d)
             d.metadata = self.flatten_metadata_for_search(metadata, page_number=pn)
             out_docs.append(d)
-        
+
         print(f"Processed: {fname} [{ct}]")
         return out_docs
 
@@ -429,14 +428,13 @@ class S3MetadataProcessor:
 
         while True:
             item = docs_q.get()
-            if item is None:  # sentinel to stop
+            if item is None:
                 break
 
             docs: List[Document] = item
             for d in docs:
                 meta = self._ensure_required_fields(self._filter_to_schema(dict(d.metadata or {})), d.page_content)
 
-                # dedupe across threads
                 doc_hash = self.hash_document(Document(page_content=d.page_content, metadata=meta))
                 with self._seen_lock:
                     if doc_hash in self.seen_hashes:
@@ -471,20 +469,12 @@ class S3MetadataProcessor:
     # ---------------- STREAMING SESSION ORCHESTRATION ----------------
 
     def stream_session(self, session_id: str) -> Dict[str, Any]:
-        """
-        Orchestrates:
-          1) Read all metadata files (parallel).
-          2) For each top_related file: schedule a download job.
-          3) As each file finishes downloading, push it to processing queue (print 'Downloaded: ...').
-          4) Processing workers parse/chunk and push docs to docs_q (print 'Processing: ...').
-          5) Main thread consumes docs_q and writes to Milvus in batches.
-        """
+        """Concurrent download → process → store pipeline with proper backpressure."""
         # 1) Read metadata files and build download plan
         keys = self.get_session_metadata_files(session_id)
         if not keys:
             return {"session_id": session_id, "processed": 0, "stored": 0, "errors": 0}
 
-        # Read metadata in parallel
         metadatas: List[Dict[str, Any]] = []
         with ThreadPoolExecutor(max_workers=min(32, self.max_workers * 2)) as ex:
             futures = [ex.submit(self.read_metadata_from_s3, k) for k in keys]
@@ -494,7 +484,6 @@ class S3MetadataProcessor:
                     md["crawl_session"] = session_id
                     metadatas.append(md)
 
-        # Build download jobs: (bucket, key, local_path, metadata, file_info)
         download_jobs: List[Tuple[str, str, str, Dict[str, Any], Dict[str, Any]]] = []
         for md in metadatas:
             for fi in md.get("top_related", []):
@@ -511,15 +500,24 @@ class S3MetadataProcessor:
         if not download_jobs:
             return {"session_id": session_id, "processed": 0, "stored": 0, "errors": 0}
 
-        # 2) Create queues
-        proc_q: Queue = Queue(maxsize=int(os.getenv("CSSF_PIPELINE_QUEUE", "100")))  # from downloader -> processor
-        docs_q: Queue = Queue(maxsize=int(os.getenv("CSSF_DOCS_QUEUE", "200")))      # from processor -> writer
+        # 2) Queues
+        proc_q: Queue = Queue(maxsize=int(os.getenv("CSSF_PIPELINE_QUEUE", "100")))  # download -> processors
+        docs_q: Queue = Queue(maxsize=int(os.getenv("CSSF_DOCS_QUEUE", "200")))      # processors -> writer
 
-        # 3) Start processing workers
+        # 3) Start writer FIRST
+        writer_result = {}
+        def writer_worker():
+            writer_result["res"] = self.store_documents_in_milvus_streaming(docs_q)
+
+        writer = threading.Thread(target=writer_worker, daemon=True)
+        writer.start()
+
+        # 4) Start processor workers
         def processor_worker():
             while True:
                 item = proc_q.get()
                 if item is None:
+                    proc_q.task_done()
                     break
                 md, fi, local_path = item
                 original_url = fi.get("url")
@@ -529,8 +527,9 @@ class S3MetadataProcessor:
                     if docs:
                         docs_q.put(docs)
                 except Exception:
-                    # silent per minimal-output requirement
                     pass
+                finally:
+                    proc_q.task_done()
 
         processors = []
         for _ in range(self.max_workers):
@@ -538,53 +537,48 @@ class S3MetadataProcessor:
             t.start()
             processors.append(t)
 
-        # 4) Start downloader workers
+        # 5) Downloader workers (produce into proc_q)
         def downloader_task(job_tuple):
             b, k, lp, md, fi = job_tuple
             original_url = fi.get("url")
-            # Always ensure file exists locally (print only when downloaded)
             try:
                 self._download_one(b, k, lp, original_url)
             except Exception:
-                # still attempt processing if file now exists (e.g., race)
                 pass
             if os.path.exists(lp) and os.path.getsize(lp) > 0:
                 proc_q.put((md, fi, lp))
 
         with ThreadPoolExecutor(max_workers=self.download_max_workers) as dl_ex:
-            for job in download_jobs:
-                dl_ex.submit(downloader_task, job)
+            futures = [dl_ex.submit(downloader_task, job) for job in download_jobs]
+            for _ in as_completed(futures):
+                pass
 
-        # 5) After all downloads submitted, wait for queue to drain, then stop processors
-        # Since we don't track futures here, a simple barrier is to wait until proc_q is empty
-        # after downloads complete. However, executors wait until submitted tasks finish.
-        # Now, signal processors to stop.
+        # 6) Wait until all proc_q tasks are handled, then stop processors
+        proc_q.join()
         for _ in range(self.max_workers):
             proc_q.put(None)
         for t in processors:
             t.join()
 
-        # 6) Signal writer to close after processors end
+        # 7) Signal writer to finish AFTER processors are done enqueuing docs
         docs_q.put(None)
-        res = self.store_documents_in_milvus_streaming(docs_q)
+        writer.join()
 
-        # Return minimal summary (not printed)
+        res = writer_result.get("res", {"count": 0, "milvus_ids": []})
         return {
             "session_id": session_id,
-            "processed": res.get("count", 0),  # approximate: number stored
+            "processed": res.get("count", 0),
             "stored": res.get("count", 0),
             "errors": 0,
         }
 
-    # --------- Backwards-compat wrappers (no prints) ----------
-
+    # Backwards-compat wrappers
     def process_latest_session(self) -> Dict[str, Any]:
         latest = self.get_most_recent_session()
         if not latest:
             return {"processed": 0, "stored": 0, "errors": 0}
         return self.stream_session(latest)
 
-    # (legacy methods kept to satisfy imports in your ecosystem)
     def process_session(self, session_id: str) -> Dict[str, Any]:
         return self.stream_session(session_id)
 
@@ -613,7 +607,7 @@ def main():
     MILVUS_CONFIG = {
         "host": "34.241.177.15",
         "port": "19530",
-        "collection_name": "cssf_documents_final_final_CGDEMO7",
+        "collection_name": "cssf_documents_final_final_CGDEMO4",
         "connection_args": {"host": "34.241.177.15", "port": "19530"},
     }
 
