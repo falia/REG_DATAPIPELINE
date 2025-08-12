@@ -327,6 +327,7 @@ class S3MetadataProcessor:
         """Parse one local file and return chunked Documents with flattened metadata. Prints 'Processing:'."""
         # Minimal output: print only once per file
         fname = self._filename_from_url_or_key(original_url, key=os.path.basename(local_path), local_path=local_path)
+        ct = (content_type or "application/octet-stream").split(";")[0].strip()
 
         content = self._read_local_bytes(local_path)
         if not content:
@@ -341,7 +342,7 @@ class S3MetadataProcessor:
             d.metadata = self.flatten_metadata_for_search(metadata, page_number=pn)
             out_docs.append(d)
         
-        print(f"Processed: {fname}")
+        print(f"Processed: {fname} [{ct}]")
         return out_docs
 
     # ---------------- metadata shaping ----------------
