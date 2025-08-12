@@ -1,0 +1,26 @@
+{
+  'url': 'https://www.cssf.lu/en/2003/12/warning-regarding-the-activities-of-a-company-named-j-p-turner-company-l-l-c/',
+  'title': 'Warning regarding the activities of a company named J.P. Turner & Company L.L.C.',
+  'subtitle': '',
+  'document_type': 'Warning',
+  'document_number': 'Unknown',
+  'publication_date': None,
+  'update_date': None,
+  'top_related': [
+    {
+      'url': 'https://www.cssf.lu/en/2003/12/warning-regarding-the-activities-of-a-company-named-j-p-turner-company-l-l-c/',
+      's3_uri': 's3://cssf-crawl/20250702_020822/en-2003-12-warning-regarding-the-activities-of-a-company-named-j-p-turner-company-l-l-c/aHR0cHM6Ly93d3cuY3NzZi5sdS9lbi8yMDAzLzEyL3dhcm5pbmctcmVnYXJkaW5nLXRoZS1hY3Rpdml0aWVzLW9mLWEtY29tcGFueS1uYW1lZC1qLXAtdHVybmVyLWNvbXBhbnktbC1sLWMv',
+      'content_type': 'text/html'
+    }
+  ],
+  'bottom_related': [],
+  'themes': [],
+  'entities': [],
+  'keywords': [],
+  'content_hash': '3b4381c83d6bc0b84bf2a126761220586edc0676be389f186baf6c9f1411931f',
+  'crawl_timestamp': '2025-07-02 00:55:25.099978',
+  'file_size': 59762,
+  'lang': 'en',
+  'super_category': 'post',
+  'crawl_session': '20250702_020822'
+}

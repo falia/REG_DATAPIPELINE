@@ -1,0 +1,223 @@
+import os
+import re
+import tempfile
+from typing import Iterable, List, Set, Tuple
+
+import fitz  # PyMuPDF
+
+from unstructured.partition.pdf import partition_pdf
+from unstructured.documents.elements import Element, Text, Title, ElementMetadata
+from unstructured.chunking.title import chunk_by_title
+from .parser import DocumentParser
+
+
+class PDFParser(DocumentParser):
+    # --- Tunables ---
+    MAX_CHARACTERS = 1500
+    NEW_AFTER_N_CHARS = 1400
+    COMBINE_UNDER_N = 250
+
+    # Header/footer patterns common in CSSF docs — adjust as needed
+    HEADER_RES = [
+        re.compile(r"^Commission de Surveillance du Secteur Financier$", re.IGNORECASE),
+        re.compile(r"^Commission de Surveillance du Secteur Financier\s+\|\s+CSSF$", re.IGNORECASE),
+        re.compile(r"^CSSF$", re.IGNORECASE),
+        re.compile(r"^Circular(?:e)?\s+CSSF\s+\d{2}/\d{3}", re.IGNORECASE),
+    ]
+    FOOTER_RES = [
+        re.compile(r"^\s*Page\s+\d+\s*/\s*\d+\s*$", re.IGNORECASE),
+        re.compile(r"^\s*\d+\s*/\s*\d+\s*$", re.IGNORECASE),
+        re.compile(r"^\s*www\.cssf\.lu\s*$", re.IGNORECASE),
+    ]
+
+    def can_process(self, url: str, content_type: str = None) -> bool:
+        url_match = url.lower().endswith(".pdf")
+        content_type_match = content_type and "application/pdf" in content_type
+        return url_match or content_type_match
+
+    # -----------------------------
+    # Public entrypoint
+    # -----------------------------
+    def parse(self, content: bytes, url: str, content_type: str):
+        with tempfile.NamedTemporaryFile(mode="wb", suffix=".pdf", delete=False) as temp_pdf:
+            temp_pdf.write(content)
+            temp_pdf_path = temp_pdf.name
+
+        try:
+            # Pass 1: PyMuPDF base parse (fast, born-digital friendly)
+            base_elements, table_pages = self._pymupdf_parse(temp_pdf_path)
+
+            # Pass 2: selectively re-parse only table pages at hi_res with table inference
+            if table_pages:
+                hires_elements = self._reparse_pages_hires(
+                    temp_pdf_path, pages=sorted(table_pages), languages=("eng",)
+                )
+                merged = self._merge_elements(base_elements, hires_elements, table_pages)
+            else:
+                merged = base_elements
+
+            # Cleanup text blocks before chunking
+            cleaned = self._clean_elements(merged)
+
+            # Chunk by title post-parse
+            chunks = chunk_by_title(
+                cleaned,
+                max_characters=self.MAX_CHARACTERS,
+                new_after_n_chars=self.NEW_AFTER_N_CHARS,
+                combine_text_under_n_chars=self.COMBINE_UNDER_N,
+            )
+            return chunks
+
+        finally:
+            try:
+                os.unlink(temp_pdf_path)
+            except Exception:
+                pass
+
+    # -----------------------------
+    # PyMuPDF base pass + table-page detection
+    # -----------------------------
+    def _pymupdf_parse(self, path: str) -> Tuple[List[Element], Set[int]]:
+        """
+        Build Unstructured elements from PyMuPDF blocks.
+        Also detect candidate table pages via simple heuristics.
+        """
+        doc = fitz.open(path)
+        elements: List[Element] = []
+        table_pages: Set[int] = set()
+
+        for page_num, page in enumerate(doc, start=1):
+            pd = page.get_text("dict")
+            # Gather font sizes to estimate a "title" threshold per page
+            sizes = []
+            for b in pd.get("blocks", []):
+                for l in b.get("lines", []) or []:
+                    for s in l.get("spans", []) or []:
+                        txt = s.get("text", "").strip()
+                        if txt:
+                            sizes.append(s.get("size", 0.0))
+
+            size_threshold = 0.0
+            if sizes:
+                sizes_sorted = sorted(sizes)
+                # Use 90th percentile (or max if few spans) as title threshold
+                idx = int(0.90 * len(sizes_sorted))
+                size_threshold = sizes_sorted[idx] if len(sizes_sorted) >= 10 else max(sizes_sorted)
+
+            # Iterate blocks and create Text/Title elements
+            for b in pd.get("blocks", []):
+                if "lines" not in b:
+                    continue
+
+                block_text_parts = []
+                block_sizes = []
+                for l in b.get("lines", []) or []:
+                    for s in l.get("spans", []) or []:
+                        t = s.get("text", "")
+                        if t:
+                            block_text_parts.append(t)
+                            block_sizes.append(s.get("size", 0.0))
+                    block_text_parts.append("\n")
+
+                text = "".join(block_text_parts).strip()
+                if not text:
+                    continue
+
+                avg_size = (sum(block_sizes) / len(block_sizes)) if block_sizes else 0.0
+                meta = ElementMetadata(page_number=page_num)
+
+                # Heuristic: short big-font blocks → Title
+                if size_threshold and avg_size >= size_threshold and len(text) < 180:
+                    el = Title(text=text, metadata=meta)
+                else:
+                    el = Text(text=text, metadata=meta)
+
+                elements.append(el)
+
+                # Table detection heuristics on this block's text
+                head = text[:600]
+                if head.count("|") >= 4 or head.count("\t") >= 8 or re.search(r"\b(Table|Annex|Appendix)\b", head, re.I):
+                    table_pages.add(page_num)
+
+        doc.close()
+        return elements, table_pages
+
+    # -----------------------------
+    # Selective hi_res re-parse
+    # -----------------------------
+    def _reparse_pages_hires(self, path: str, pages: Iterable[int], languages: Iterable[str]) -> List[Element]:
+        return partition_pdf(
+            filename=path,
+            strategy="hi_res",
+            hi_res_model_name="detectron2_onnx",
+            pages=list(pages),
+            include_page_breaks=True,
+            languages=list(languages),
+            infer_table_structure=True,
+            extract_images_in_pdf=True,
+            extract_image_block_types=["Table"],
+            chunking_strategy=None,
+        )
+
+
+    # -----------------------------
+    # Merge: keep PyMuPDF elements for non-table pages, replace table pages with hi_res
+    # -----------------------------
+    def _merge_elements(
+            self,
+            base_elements: List[Element],
+            hires_elements: List[Element],
+            table_pages: Set[int],
+    ) -> List[Element]:
+        if not hires_elements:
+            return base_elements
+
+        # keep base elements for non-table pages
+        kept = [
+            el for el in base_elements
+            if (getattr(getattr(el, "metadata", None), "page_number", None) not in table_pages)
+        ]
+        merged = kept + hires_elements  # may contain elements with page_number=None
+
+        def _page_num(el: Element) -> int:
+            """Return a sortable page number; coalesce None/missing to a large sentinel."""
+            meta = getattr(el, "metadata", None)
+            p = getattr(meta, "page_number", None)
+            # if p is an int, keep it; else push to the end
+            return p if isinstance(p, int) and p is not None else 10 ** 9
+
+        # stable sort: use original index as tiebreaker so relative order is preserved
+        indexed = list(enumerate(merged))
+        indexed.sort(key=lambda pair: (_page_num(pair[1]), pair[0]))
+        return [el for _, el in indexed]
+
+    # -----------------------------
+    # Cleanup: strip headers/footers + fix hyphenation/linebreaks
+    # -----------------------------
+    def _strip_headers_footers(self, text: str) -> str:
+        if not text:
+            return text
+        lines = text.splitlines()
+        if lines and any(r.match(lines[0]) for r in self.HEADER_RES):
+            lines = lines[1:]
+        if lines and any(r.match(lines[-1]) for r in self.FOOTER_RES):
+            lines = lines[:-1]
+        return "\n".join(lines)
+
+    def _fix_hyphenation(self, text: str) -> str:
+        if not text:
+            return text
+        text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
+        text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
+        return text
+
+    def _clean_elements(self, elements: List[Element]) -> List[Element]:
+        cleaned: List[Element] = []
+        for el in elements:
+            if isinstance(el, Text) and hasattr(el, "text"):
+                t = el.text or ""
+                t = self._strip_headers_footers(t)
+                t = self._fix_hyphenation(t)
+                el.text = t
+            cleaned.append(el)
+        return cleaned

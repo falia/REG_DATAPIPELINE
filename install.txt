@@ -94,3 +94,28 @@ source venv/bin/activate
 
 pip install --upgrade pip
 pip install -r requirements.txt
+
+
+
+------
+onnx issue:
+https://github.com/Unstructured-IO/unstructured/issues/3718#event-16293117390
+
+pip uninstall -y unstructured-inference
+git clone https://github.com/Unstructured-IO/unstructured-inference.git
+cd unstructured-inference
+cp onnx-issue/detectron2onnx.py unstructured-inference/models
+pip install -e .
+
+# 5) verify the installed path is your clone
+python - << 'PY'
+import inspect, unstructured_inference.models.detectron2_onnx as m
+print("Using:", m.__file__)
+print("Patch snippet present? ", "CUDAExecutionProvider" in open(m.__file__, 'r', encoding='utf-8').read())
+PY
+
+pip install onnxruntime-gpu==1.22.0
+
+
+*** pip uninstall -y onnxruntime onnxruntime-gpu onnxruntime-directml onnxruntime-openvino
+** pip install --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ onnxruntime-gpu==1.21.0.dev20250306002

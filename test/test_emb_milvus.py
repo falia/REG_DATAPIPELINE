@@ -349,7 +349,7 @@ def test_embedding_only_operations():
 def cleanup():
     """Cleanup connections"""
     try:
-        from embeddings.milvus_provider.mivlus_provider import MilvusManager
+        from embeddings.milvus_provider.milvus_provider import MilvusManager
         MilvusManager.disconnect()
         print("✓ Disconnected from Milvus")
     except Exception as e:
