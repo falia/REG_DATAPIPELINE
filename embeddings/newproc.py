@@ -326,7 +326,7 @@ class S3MetadataProcessor:
         """Parse one local file and return chunked Documents with flattened metadata. Prints content type."""
         fname = self._filename_from_url_or_key(original_url, key=os.path.basename(local_path), local_path=local_path)
         ct = (content_type or "application/octet-stream").split(";")[0].strip()
-        print(f"Processing: {fname} [{ct}]")
+        #print(f"Processing: {fname} [{ct}]")
 
         content = self._read_local_bytes(local_path)
         if not content:
