@@ -300,7 +300,7 @@ class S3MetadataProcessor:
                 Filename=dst_for_api,
                 Config=self.transfer_config,
             )
-            print(f"Downloaded: {self._filename_from_url_or_key(original_url, key, dst_path)}")
+            #print(f"Downloaded: {self._filename_from_url_or_key(original_url, key, dst_path)}")
             return (dst_path, True)
         except OSError as oe:
             if getattr(oe, "errno", None) == errno.ENOSPC:
