@@ -10,6 +10,7 @@ import logging
 import threading
 import shutil
 import errno
+import mimetypes
 from typing import List, Dict, Any, Optional, Iterable, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
@@ -23,6 +24,8 @@ from embeddings.embedding_provider.embedding_provider import EmbeddingService
 from embeddings.chunker.document_chunker import DocumentChunker
 from embeddings.parsers.parser import EurlexHTMLParser, CSSFHTMLParser, PDFParserPipeline, DocumentProcessor
 
+# ✅ external tracker
+from embeddings.tracker import Progress
 
 # Allowed fields
 ALLOWED_FIELDS = {
@@ -33,10 +36,8 @@ ALLOWED_FIELDS = {
     "page_number", "top_related", "bottom_related", "themes", "entities", "keywords",
 }
 
-
 def _ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
-
 
 # ---------- Windows/path safety helpers ----------
 _INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
@@ -82,13 +83,11 @@ def _safe_local_rel_from_key(s3_key: str) -> str:
     rel_path = os.path.join(*safe_head, leaf) if safe_head else leaf
     return rel_path
 
-
 def _parse_s3_uri(s3_uri: str) -> Tuple[str, str]:
     if s3_uri.startswith("s3://"):
         u = urlparse(s3_uri)
         return u.netloc, u.path.lstrip("/")
     return "", s3_uri
-
 
 class S3MetadataProcessor:
     def __init__(
@@ -129,7 +128,6 @@ class S3MetadataProcessor:
         self.seen_hashes: set[str] = set()
         self._seen_lock = threading.Lock()
 
-        # Silence logging (we only print filenames)
         logging.basicConfig(level=logging.CRITICAL, format="%(asctime)s %(levelname)s %(message)s")
         self.logger = logging.getLogger(__name__)
 
@@ -151,6 +149,9 @@ class S3MetadataProcessor:
         # Disk space policy (env-overridable)
         self.min_free_bytes = int(float(os.getenv("CSSF_MIN_FREE_MB", "8192")) * 1024 * 1024)     # 8 GB floor
         self.max_cache_bytes = int(float(os.getenv("CSSF_MAX_CACHE_GB", "200")) * 1024 * 1024 * 1024)  # 200 GB
+
+        # progress handle (set in stream_session)
+        self._progress: Optional[Progress] = None
 
     # ---------------- util ----------------
 
@@ -446,12 +447,17 @@ class S3MetadataProcessor:
 
                 if len(batch) >= self.batch_store_size:
                     cnt, ids = self._flush_batch(batch)
+                    # progress: stored docs
+                    if self._progress:
+                        self._progress.inc_stored(cnt)
                     total_count += cnt
                     all_ids.extend(ids)
                     batch = []
 
         if batch:
             cnt, ids = self._flush_batch(batch)
+            if self._progress:
+                self._progress.inc_stored(cnt)
             total_count += cnt
             all_ids.extend(ids)
 
@@ -462,14 +468,15 @@ class S3MetadataProcessor:
             texts = [d.page_content for d in docs]
             metas = [d.metadata for d in docs]
             result = self.embedding_service.add_texts_to_store(texts=texts, metadatas=metas)
-            return result.get("count", len(docs)), result.get("milvus_ids", [])
+            cnt = result.get("count", len(docs))
+            return cnt, result.get("milvus_ids", [])
         except Exception:
             return (0, [])
 
     # ---------------- STREAMING SESSION ORCHESTRATION ----------------
 
     def stream_session(self, session_id: str) -> Dict[str, Any]:
-        """Concurrent download → process → store pipeline with proper backpressure."""
+        """Concurrent download → process → store pipeline with proper backpressure + progress tracker."""
         # 1) Read metadata files and build download plan
         keys = self.get_session_metadata_files(session_id)
         if not keys:
@@ -500,11 +507,32 @@ class S3MetadataProcessor:
         if not download_jobs:
             return {"session_id": session_id, "processed": 0, "stored": 0, "errors": 0}
 
-        # 2) Queues
+        # 2) Progress + heartbeat
+        progress = Progress(total_files=len(download_jobs))
+        self._progress = progress
+
+        hb_stop = threading.Event()
+        hb_interval = float(os.getenv("CSSF_PROGRESS_EVERY", "5"))
+
+        def heartbeat():
+            if os.getenv("CSSF_PROGRESS", "1") == "0":
+                return
+            while not hb_stop.wait(hb_interval):
+                snap = progress.snapshot()
+                print(
+                    "[PROG] dl {dl}/{tot} ({pdl:.1f}%) | proc {pr}/{tot} ({ppr:.1f}%) | stored_docs {sd} | rate {r:.2f} f/s | ETA ~ {eta:.0f}s"
+                    .format(dl=snap["downloaded"], pr=snap["processed"], sd=snap["stored_docs"], tot=snap["total"],
+                            pdl=snap["pct_dl"], ppr=snap["pct_pr"], r=snap["rate_fps"], eta=snap["eta_sec"])
+                )
+
+        hb = threading.Thread(target=heartbeat, name="PROG", daemon=True)
+        hb.start()
+
+        # 3) Queues
         proc_q: Queue = Queue(maxsize=int(os.getenv("CSSF_PIPELINE_QUEUE", "100")))  # download -> processors
         docs_q: Queue = Queue(maxsize=int(os.getenv("CSSF_DOCS_QUEUE", "200")))      # processors -> writer
 
-        # 3) Start writer FIRST
+        # 4) Start writer FIRST
         writer_result = {}
         def writer_worker():
             writer_result["res"] = self.store_documents_in_milvus_streaming(docs_q)
@@ -512,7 +540,7 @@ class S3MetadataProcessor:
         writer = threading.Thread(target=writer_worker, daemon=True)
         writer.start()
 
-        # 4) Start processor workers
+        # 5) Start processor workers
         def processor_worker():
             while True:
                 item = proc_q.get()
@@ -520,24 +548,30 @@ class S3MetadataProcessor:
                     proc_q.task_done()
                     break
                 md, fi, local_path = item
-                original_url = fi.get("url")
-                content_type = fi.get("content_type", "application/octet-stream")
+                original_url = (fi.get("url") or "").strip()
+                ct = (fi.get("content_type") or "").strip()
+                if not ct or ct == "application/octet-stream":
+                    guess, _ = mimetypes.guess_type(original_url or local_path)
+                    if not guess and (original_url.lower().endswith(".pdf") or local_path.lower().endswith(".pdf")):
+                        guess = "application/pdf"
+                    ct = guess or "application/octet-stream"
                 try:
-                    docs = self._process_one_file(md, original_url, content_type, local_path)
+                    docs = self._process_one_file(md, original_url, ct, local_path)
                     if docs:
                         docs_q.put(docs)
                 except Exception:
                     pass
                 finally:
+                    progress.inc_processed(1)  # ✅ file processed (even if 0 chunks)
                     proc_q.task_done()
 
         processors = []
-        for _ in range(self.max_workers):
-            t = threading.Thread(target=processor_worker, daemon=True)
+        for i in range(self.max_workers):
+            t = threading.Thread(target=processor_worker, name=f"PROC-{i+1:02d}", daemon=True)
             t.start()
             processors.append(t)
 
-        # 5) Downloader workers (produce into proc_q)
+        # 6) Downloader workers (produce into proc_q)
         def downloader_task(job_tuple):
             b, k, lp, md, fi = job_tuple
             original_url = fi.get("url")
@@ -547,22 +581,27 @@ class S3MetadataProcessor:
                 pass
             if os.path.exists(lp) and os.path.getsize(lp) > 0:
                 proc_q.put((md, fi, lp))
+                progress.inc_downloaded(1)  # ✅ ready for processing
 
-        with ThreadPoolExecutor(max_workers=self.download_max_workers) as dl_ex:
+        with ThreadPoolExecutor(max_workers=self.download_max_workers, thread_name_prefix="DL") as dl_ex:
             futures = [dl_ex.submit(downloader_task, job) for job in download_jobs]
             for _ in as_completed(futures):
                 pass
 
-        # 6) Wait until all proc_q tasks are handled, then stop processors
+        # 7) Wait until all proc_q tasks are handled, then stop processors
         proc_q.join()
         for _ in range(self.max_workers):
             proc_q.put(None)
         for t in processors:
             t.join()
 
-        # 7) Signal writer to finish AFTER processors are done enqueuing docs
+        # 8) Signal writer to finish AFTER processors are done enqueuing docs
         docs_q.put(None)
         writer.join()
+
+        # 9) stop heartbeat
+        hb_stop.set()
+        hb.join(timeout=1)
 
         res = writer_result.get("res", {"count": 0, "milvus_ids": []})
         return {
@@ -582,7 +621,6 @@ class S3MetadataProcessor:
     def process_session(self, session_id: str) -> Dict[str, Any]:
         return self.stream_session(session_id)
 
-
 def main():
     S3_BUCKET = os.getenv("CSSF_S3_BUCKET", "cssf-crawl")
     SESSION_ID = os.getenv("CSSF_SESSION_ID")
@@ -599,6 +637,10 @@ def main():
     # queue sizes
     os.environ.setdefault("CSSF_PIPELINE_QUEUE", "100")
     os.environ.setdefault("CSSF_DOCS_QUEUE", "200")
+
+    # progress heartbeat controls
+    os.environ.setdefault("CSSF_PROGRESS_EVERY", "5")  # seconds
+    os.environ.setdefault("CSSF_PROGRESS", "1")        # 1=on, 0=off
 
     # cache policy defaults for big machine
     os.environ.setdefault("CSSF_MIN_FREE_MB", "8192")
@@ -627,7 +669,6 @@ def main():
     target_session = SESSION_ID or processor.get_most_recent_session()
     if target_session:
         processor.stream_session(target_session)
-
 
 if __name__ == "__main__":
     main()
