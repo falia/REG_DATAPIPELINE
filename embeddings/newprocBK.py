@@ -121,14 +121,7 @@ class S3MetadataProcessor:
             use_threads=True,
         )
 
-        # ---- Parser wiring ----
-        # Use a shared, lightweight HTML processor
-        self.html_processor = DocumentProcessor(parsers=[EurlexHTMLParser(), CSSFHTMLParser()])
-        # PDF parser is NOT shared; created per-thread (thread-local) to avoid cross-thread state.
-        self._tls = threading.local()
-        self.pdf_max_concurrency = int(os.getenv("CSSF_PDF_CONCURRENCY", "16"))
-        self._pdf_slots = threading.Semaphore(self.pdf_max_concurrency)
-
+        self.processor = DocumentProcessor(parsers=[EurlexHTMLParser(), CSSFHTMLParser(), PDFParserPipeline()])
         self.chunker = DocumentChunker(max_chunk_size=1800, overlap=200)
 
         # dedupe structures (thread-safe)
@@ -282,49 +275,65 @@ class S3MetadataProcessor:
         base = os.path.basename(key) or (os.path.basename(local_path) if local_path else "")
         return base or "document"
 
-    # ---------------- parsing helpers (HTML vs PDF) ----------------
-
-    def _is_pdf_type(self, content_type: str, original_url: str, local_path: str) -> bool:
-        ct = (content_type or "").lower()
-        if "pdf" in ct:
-            return True
-        p = (original_url or local_path or "").lower()
-        return p.endswith(".pdf")
-
-    def _get_thread_pdf_parser(self) -> PDFParserPipeline:
-        """Create/reuse a PDF parser per-thread to avoid cross-thread sharing."""
-        if not hasattr(self._tls, "pdf_parser"):
-            self._tls.pdf_parser = PDFParserPipeline()
-        return self._tls.pdf_parser
-
-    def _parse_to_elements(self, content: bytes, original_url: str, content_type: str, is_pdf: bool):
-        if is_pdf:
-            parser = self._get_thread_pdf_parser()
-            return parser.process(content, original_url, "application/pdf")
-        # Non-PDF: shared HTML-capable processor
-        return self.html_processor.process(content, original_url, content_type)
-
     # ---------------- streaming pipeline helpers ----------------
+
+    def _download_one(self, bucket: str, key: str, dst_path: str, original_url: Optional[str]) -> Tuple[str, bool]:
+        """Download a single S3 object to dst_path. Returns (dst_path, did_download). Prints only when downloaded."""
+        _ensure_dir(os.path.dirname(dst_path))
+        if os.path.exists(dst_path) and os.path.getsize(dst_path) > 0:
+            return (dst_path, False)
+
+        expected = 64 * 1024 * 1024
+        try:
+            head = self.s3.head_object(Bucket=bucket, Key=key)
+            expected = int(head.get("ContentLength") or expected)
+        except Exception:
+            pass
+
+        self._ensure_space_for(expected)
+
+        try:
+            dst_for_api = _win_long_path(dst_path)
+            self.s3.download_file(
+                Bucket=bucket,
+                Key=key,
+                Filename=dst_for_api,
+                Config=self.transfer_config,
+            )
+            #print(f"Downloaded: {self._filename_from_url_or_key(original_url, key, dst_path)}")
+            return (dst_path, True)
+        except OSError as oe:
+            if getattr(oe, "errno", None) == errno.ENOSPC:
+                self._evict_cache(self.min_free_bytes + expected)
+                try:
+                    dst_for_api = _win_long_path(dst_path)
+                    self.s3.download_file(
+                        Bucket=bucket,
+                        Key=key,
+                        Filename=dst_for_api,
+                        Config=self.transfer_config,
+                    )
+                    print(f"Downloaded: {self._filename_from_url_or_key(original_url, key, dst_path)}")
+                    return (dst_path, True)
+                except Exception:
+                    return (dst_path, False)
+            else:
+                return (dst_path, False)
+        except Exception:
+            return (dst_path, False)
 
     def _process_one_file(self, metadata: Dict[str, Any], original_url: str, content_type: str, local_path: str) -> List[Document]:
         """Parse one local file and return chunked Documents with flattened metadata. Prints content type."""
         fname = self._filename_from_url_or_key(original_url, key=os.path.basename(local_path), local_path=local_path)
         ct = (content_type or "application/octet-stream").split(";")[0].strip()
+        #print(f"Processing: {fname} [{ct}]")
 
         content = self._read_local_bytes(local_path)
         if not content:
             print(f"Processed: {fname} [{ct}]")
             return []
 
-        is_pdf = self._is_pdf_type(ct, original_url, local_path)
-
-        # PDF parsing is throttled to avoid choking other workers
-        if is_pdf:
-            with self._pdf_slots:
-                elements = self._parse_to_elements(content, original_url, ct, is_pdf=True)
-        else:
-            elements = self._parse_to_elements(content, original_url, ct, is_pdf=False)
-
+        elements = self.processor.process(content, original_url, content_type)
         chunked_docs = self.chunker.chunk_document(elements, original_url)
 
         out_docs: List[Document] = []
@@ -412,15 +421,11 @@ class S3MetadataProcessor:
         base = (doc.page_content + str(doc.metadata.get("url", "")) + str(doc.metadata.get("page_number", 0))).encode("utf-8")
         return hashlib.sha256(base).hexdigest()
 
-
     def store_documents_in_milvus_streaming(self, docs_q: Queue) -> Dict[str, Any]:
         """Consume docs lists from a queue and flush to Milvus in batches."""
         total_count = 0
         all_ids: List[Any] = []
         batch: List[Document] = []
-        error_count = 0
-        consecutive_failures = 0
-        max_consecutive_failures = 5  # Stop after 5 consecutive failures
 
         while True:
             item = docs_q.get()
@@ -441,83 +446,22 @@ class S3MetadataProcessor:
                 batch.append(Document(page_content=d.page_content, metadata=meta))
 
                 if len(batch) >= self.batch_store_size:
-                    success = self._flush_batch_with_retry(batch, error_count)
-                    if success:
-                        cnt, ids = success
-                        consecutive_failures = 0
-                        if self._progress:
-                            self._progress.inc_stored(cnt)
-                        total_count += cnt
-                        all_ids.extend(ids)
-                        print(f"✅ Stored batch of {cnt} documents (total: {total_count})")
-                    else:
-                        error_count += len(batch)
-                        consecutive_failures += 1
-                        print(f"❌ Failed to store batch of {len(batch)} documents (consecutive failures: {consecutive_failures})")
-                        
-                        # Stop processing if too many consecutive failures
-                        if consecutive_failures >= max_consecutive_failures:
-                            print(f"💀 Stopping due to {consecutive_failures} consecutive failures. Milvus appears to be down.")
-                            # Put the item back in queue so other workers can see the None signal
-                            docs_q.put(item)
-                            break
-                    
+                    cnt, ids = self._flush_batch(batch)
+                    # progress: stored docs
+                    if self._progress:
+                        self._progress.inc_stored(cnt)
+                    total_count += cnt
+                    all_ids.extend(ids)
                     batch = []
 
-        # Process final batch
         if batch:
-            success = self._flush_batch_with_retry(batch, error_count)
-            if success:
-                cnt, ids = success
-                if self._progress:
-                    self._progress.inc_stored(cnt)
-                total_count += cnt
-                all_ids.extend(ids)
-                print(f"✅ Stored final batch of {cnt} documents")
-            else:
-                error_count += len(batch)
-                print(f"❌ Failed to store final batch of {len(batch)} documents")
+            cnt, ids = self._flush_batch(batch)
+            if self._progress:
+                self._progress.inc_stored(cnt)
+            total_count += cnt
+            all_ids.extend(ids)
 
-        print(f"📊 Storage complete: {total_count} stored, {error_count} failed")
-        return {"count": total_count, "milvus_ids": all_ids, "errors": error_count}
-
-    def _flush_batch_with_retry(self, docs: List[Document], current_error_count: int) -> Optional[Tuple[int, List[Any]]]:
-        """Flush batch with retry logic and detailed error reporting."""
-        max_retries = 3
-        base_delay = 1.0
-        
-        for attempt in range(max_retries):
-            try:
-                texts = [d.page_content for d in docs]
-                metas = [d.metadata for d in docs]
-                
-                print(f"🔄 Attempting to store {len(docs)} documents (attempt {attempt + 1}/{max_retries})...")
-                result = self.embedding_service.add_texts_to_store(texts=texts, metadatas=metas)
-                cnt = result.get("count", len(docs))
-                
-                if cnt > 0:
-                    return cnt, result.get("milvus_ids", [])
-                else:
-                    print(f"⚠️  Milvus returned 0 count for {len(docs)} documents")
-                    
-            except Exception as e:
-                print(f"💥 Milvus error (attempt {attempt + 1}/{max_retries}): {type(e).__name__}: {e}")
-                if attempt == 0:  # Only print full traceback on first attempt
-                    import traceback
-                    traceback.print_exc()
-                
-                if attempt < max_retries - 1:
-                    delay = base_delay * (2 ** attempt)  # Exponential backoff
-                    print(f"⏳ Retrying in {delay:.1f} seconds...")
-                    time.sleep(delay)
-        
-        print(f"💀 All {max_retries} attempts failed for batch of {len(docs)} documents")
-        return None
-
-
-
-
-
+        return {"count": total_count, "milvus_ids": all_ids}
 
     def _flush_batch(self, docs: List[Document]) -> Tuple[int, List[Any]]:
         try:
@@ -612,14 +556,7 @@ class S3MetadataProcessor:
                         guess = "application/pdf"
                     ct = guess or "application/octet-stream"
                 try:
-                    # Route to PDF/non-PDF paths; PDF path is semaphore-limited.
-                    is_pdf = self._is_pdf_type(ct, original_url, local_path)
-                    if is_pdf:
-                        with self._pdf_slots:
-                            docs = self._process_one_file(md, original_url, "application/pdf", local_path)
-                    else:
-                        docs = self._process_one_file(md, original_url, ct, local_path)
-
+                    docs = self._process_one_file(md, original_url, ct, local_path)
                     if docs:
                         docs_q.put(docs)
                 except Exception:
@@ -684,52 +621,6 @@ class S3MetadataProcessor:
     def process_session(self, session_id: str) -> Dict[str, Any]:
         return self.stream_session(session_id)
 
-    # ---------------- download helper ----------------
-
-    def _download_one(self, bucket: str, key: str, dst_path: str, original_url: Optional[str]) -> Tuple[str, bool]:
-        """Download a single S3 object to dst_path. Returns (dst_path, did_download). Prints only when downloaded."""
-        _ensure_dir(os.path.dirname(dst_path))
-        if os.path.exists(dst_path) and os.path.getsize(dst_path) > 0:
-            return (dst_path, False)
-
-        expected = 64 * 1024 * 1024
-        try:
-            head = self.s3.head_object(Bucket=bucket, Key=key)
-            expected = int(head.get("ContentLength") or expected)
-        except Exception:
-            pass
-
-        self._ensure_space_for(expected)
-
-        try:
-            dst_for_api = _win_long_path(dst_path)
-            self.s3.download_file(
-                Bucket=bucket,
-                Key=key,
-                Filename=dst_for_api,
-                Config=self.transfer_config,
-            )
-            return (dst_path, True)
-        except OSError as oe:
-            if getattr(oe, "errno", None) == errno.ENOSPC:
-                self._evict_cache(self.min_free_bytes + expected)
-                try:
-                    dst_for_api = _win_long_path(dst_path)
-                    self.s3.download_file(
-                        Bucket=bucket,
-                        Key=key,
-                        Filename=dst_for_api,
-                        Config=self.transfer_config,
-                    )
-                    print(f"Downloaded: {self._filename_from_url_or_key(original_url, key, dst_path)}")
-                    return (dst_path, True)
-                except Exception:
-                    return (dst_path, False)
-            else:
-                return (dst_path, False)
-        except Exception:
-            return (dst_path, False)
-
 def main():
     S3_BUCKET = os.getenv("CSSF_S3_BUCKET", "cssf-crawl")
     SESSION_ID = os.getenv("CSSF_SESSION_ID")
@@ -754,9 +645,6 @@ def main():
     # cache policy defaults for big machine
     os.environ.setdefault("CSSF_MIN_FREE_MB", "8192")
     os.environ.setdefault("CSSF_MAX_CACHE_GB", "200")
-
-    # NEW: cap PDF concurrency (defaults to 4)
-    os.environ.setdefault("CSSF_PDF_CONCURRENCY", "4")
 
     MILVUS_CONFIG = {
         "host": "54.217.166.223",
