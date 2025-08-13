@@ -270,13 +270,33 @@ class PooledONNXProcessor:
         except:
             return b""
 
-    def flatten_metadata_for_search(self, metadata: dict, page_number: int = None) -> dict:
-        return {
-            "url": metadata.get("url", ""),
-            "title": metadata.get("title", ""),
-            "crawl_session": metadata.get("crawl_session", ""),
-            "page_number": page_number or 0
+    def flatten_metadata_for_search(self, metadata: dict, page_number: int | None = None) -> dict:
+        md = {
+            "url": self._clamp(metadata.get("url", ""), 1000),
+            "title": self._clamp(metadata.get("title", ""), 1000),
+            "subtitle": self._clamp(metadata.get("subtitle", ""), 500),
+            "document_type": self._clamp(metadata.get("document_type", ""), 100),
+            "document_number": self._clamp(metadata.get("document_number", ""), 100),
+            "publication_date": self._clamp(metadata.get("publication_date") or "", 50),
+            "update_date": self._clamp(metadata.get("update_date") or "", 50),
+            "content_hash": self._clamp(metadata.get("content_hash", ""), 100),
+            "crawl_timestamp": self._clamp(metadata.get("crawl_timestamp", ""), 50),
+            "file_size": int(metadata.get("file_size") or 0),
+            "lang": self._clamp(metadata.get("lang", ""), 10),
+            "super_category": self._clamp(metadata.get("super_category", ""), 100),
+            "crawl_session": self._clamp(metadata.get("crawl_session", ""), 50),
+            "top_related": self._as_json(metadata.get("top_related", []), []),
+            "bottom_related": self._as_json(metadata.get("bottom_related", []), []),
+            "themes": self._as_json(metadata.get("themes", []), []),
+            "entities": self._as_json(metadata.get("entities", []), []),
+            "keywords": self._as_json(metadata.get("keywords", []), []),
         }
+        if page_number is not None:
+            try:
+                md["page_number"] = int(page_number)
+            except Exception:
+                md["page_number"] = 0
+        return md
 
     def _extract_page_number(self, doc: Document) -> int:
         try:
@@ -465,7 +485,7 @@ class PooledONNXProcessor:
         final_stats = self.tracker.get_stats()
         
         print(f"\n{'='*60}")
-        print(f"🎯 ONNX POOL PROCESSING COMPLETE!")
+        print(f"   ONNX POOL PROCESSING COMPLETE!")
         print(f"   ONNX sessions used: {self.onnx_pool.pool_size}")
         print(f"   Total documents: {final_stats['total_processed']}")
         print(f"   Max concurrent: {final_stats['max_concurrent']}")
@@ -485,7 +505,7 @@ def main():
     MILVUS_CONFIG = {
         "host": "54.217.166.223",
         "port": "19530", 
-        "collection_name": "cssf_documents_final_final_CGDEMO4",
+        "collection_name": "cssf_documents_final_final_CGDEM101",
         "connection_args": {"host": "54.217.166.223", "port": "19530"},
     }
 
