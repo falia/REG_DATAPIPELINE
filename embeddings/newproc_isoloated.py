@@ -317,7 +317,70 @@ class ProcessIsolatedONNXPipeline:
     # Storage in Milvus (main)
     # -----------------------
     def store_documents_in_milvus(self, documents: List[Document]) -> Dict[str, Any]:
+        """Store documents in Milvus using FULL flattened metadata.
+        Ensures required schema fields (e.g., `subtitle`) are always present
+        and types are normalized to match the collection schema.
+        """
         if not documents:
+            return {"count": 0, "milvus_ids": []}
+
+        REQUIRED_FIELDS = [
+            "url", "title", "subtitle", "document_type", "document_number",
+            "publication_date", "update_date", "content_hash", "crawl_timestamp",
+            "file_size", "lang", "super_category", "crawl_session",
+            "top_related", "bottom_related", "themes", "entities", "keywords",
+            "page_number",
+        ]
+        INT_FIELDS = {"file_size", "page_number"}
+        JSON_STRING_FIELDS = {"top_related", "bottom_related", "themes", "entities", "keywords"}
+
+        def _normalize_meta(md: Dict[str, Any]) -> Dict[str, Any]:
+            m = dict(md or {})
+            # Ensure all required fields exist
+            for f in REQUIRED_FIELDS:
+                if f not in m or m[f] is None:
+                    m[f] = 0 if f in INT_FIELDS else ""
+            # Coerce ints
+            for f in INT_FIELDS:
+                try:
+                    m[f] = int(m.get(f, 0) or 0)
+                except Exception:
+                    m[f] = 0
+            # Ensure JSON-encoded strings for array-ish fields
+            for f in JSON_STRING_FIELDS:
+                v = m.get(f, [])
+                if not isinstance(v, str):
+                    try:
+                        m[f] = json.dumps(v if v is not None else [])
+                    except Exception:
+                        m[f] = json.dumps([])
+            return m
+
+        new_docs, texts, metas = [], [], []
+        for d in documents:
+            # Start from the document's flattened metadata
+            base_meta = _normalize_meta(d.metadata)
+            base_meta["doc_id"] = hashlib.sha256((d.page_content + base_meta.get("url", "")).encode()).hexdigest()
+
+            # Thread-safe de-dup on doc_id
+            with self._seen_hashes_lock:
+                if base_meta["doc_id"] in self._seen_hashes:
+                    continue
+                self._seen_hashes.add(base_meta["doc_id"])
+
+            new_docs.append(d)
+            texts.append(d.page_content)
+            metas.append(base_meta)
+
+        if not new_docs:
+            return {"count": 0, "milvus_ids": []}
+
+        try:
+            result = self.embedding_service.add_texts_to_store(texts=texts, metadatas=metas)
+            print(f"💾 Stored {result['count']} documents in Milvus")
+            return result
+        except Exception as e:
+            print(f"❌ Failed to store in Milvus: {e}")
             return {"count": 0, "milvus_ids": []}
 
         new_docs, texts, metas = [], [], []
