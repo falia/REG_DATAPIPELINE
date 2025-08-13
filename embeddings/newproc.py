@@ -414,13 +414,42 @@ class S3MetadataProcessor:
 
 
     def store_documents_in_milvus_streaming(self, docs_q: Queue) -> Dict[str, Any]:
-        """Consume docs lists from a queue and flush to Milvus in batches."""
+        """
+        Consume docs from a queue and flush to Milvus in smaller batches, with a time-based flush too.
+        This prevents the first big batch from blocking the entire pipeline.
+        """
         total_count = 0
         all_ids: List[Any] = []
         batch: List[Document] = []
-        error_count = 0
-        consecutive_failures = 0
-        max_consecutive_failures = 5  # Stop after 5 consecutive failures
+
+        # tunables (env)
+        batch_target = self.batch_store_size                           # e.g., 128–256
+        flush_sec = float(os.getenv("CSSF_EMBED_FLUSH_SEC", "2.0"))     # flush every N seconds even if batch small
+        last_flush = time.time()
+
+        def _flush_now():
+            nonlocal batch, total_count, all_ids, last_flush
+            if not batch:
+                last_flush = time.time()
+                return
+            try:
+                texts = [d.page_content for d in batch]
+                metas = [d.metadata for d in batch]
+                # optional: quick progress hint
+                # print(f"[EMBED] flushing {len(batch)} docs...")
+                result = self.embedding_service.add_texts_to_store(texts=texts, metadatas=metas)
+                cnt = result.get("count", len(batch))
+                ids = result.get("milvus_ids", [])
+                total_count += cnt
+                all_ids.extend(ids)
+                if self._progress:
+                    self._progress.inc_stored(cnt)
+            except Exception as e:
+                # don't kill the pipeline on embed failure; log & drop this batch
+                print(f"[EMBED][WARN] flush failed for {len(batch)} docs: {e}", file=sys.stderr)
+            finally:
+                batch = []
+                last_flush = time.time()
 
         while True:
             item = docs_q.get()
@@ -440,80 +469,18 @@ class S3MetadataProcessor:
 
                 batch.append(Document(page_content=d.page_content, metadata=meta))
 
-                if len(batch) >= self.batch_store_size:
-                    success = self._flush_batch_with_retry(batch, error_count)
-                    if success:
-                        cnt, ids = success
-                        consecutive_failures = 0
-                        if self._progress:
-                            self._progress.inc_stored(cnt)
-                        total_count += cnt
-                        all_ids.extend(ids)
-                        print(f"✅ Stored batch of {cnt} documents (total: {total_count})")
-                    else:
-                        error_count += len(batch)
-                        consecutive_failures += 1
-                        print(f"❌ Failed to store batch of {len(batch)} documents (consecutive failures: {consecutive_failures})")
-                        
-                        # Stop processing if too many consecutive failures
-                        if consecutive_failures >= max_consecutive_failures:
-                            print(f"💀 Stopping due to {consecutive_failures} consecutive failures. Milvus appears to be down.")
-                            # Put the item back in queue so other workers can see the None signal
-                            docs_q.put(item)
-                            break
-                    
-                    batch = []
+                # size-based flush
+                if len(batch) >= batch_target:
+                    _flush_now()
 
-        # Process final batch
-        if batch:
-            success = self._flush_batch_with_retry(batch, error_count)
-            if success:
-                cnt, ids = success
-                if self._progress:
-                    self._progress.inc_stored(cnt)
-                total_count += cnt
-                all_ids.extend(ids)
-                print(f"✅ Stored final batch of {cnt} documents")
-            else:
-                error_count += len(batch)
-                print(f"❌ Failed to store final batch of {len(batch)} documents")
+                # time-based flush
+                elif (time.time() - last_flush) >= flush_sec:
+                    _flush_now()
 
-        print(f"📊 Storage complete: {total_count} stored, {error_count} failed")
-        return {"count": total_count, "milvus_ids": all_ids, "errors": error_count}
+        # final flush
+        _flush_now()
 
-    def _flush_batch_with_retry(self, docs: List[Document], current_error_count: int) -> Optional[Tuple[int, List[Any]]]:
-        """Flush batch with retry logic and detailed error reporting."""
-        max_retries = 3
-        base_delay = 1.0
-        
-        for attempt in range(max_retries):
-            try:
-                texts = [d.page_content for d in docs]
-                metas = [d.metadata for d in docs]
-                
-                print(f"🔄 Attempting to store {len(docs)} documents (attempt {attempt + 1}/{max_retries})...")
-                result = self.embedding_service.add_texts_to_store(texts=texts, metadatas=metas)
-                cnt = result.get("count", len(docs))
-                
-                if cnt > 0:
-                    return cnt, result.get("milvus_ids", [])
-                else:
-                    print(f"⚠️  Milvus returned 0 count for {len(docs)} documents")
-                    
-            except Exception as e:
-                print(f"💥 Milvus error (attempt {attempt + 1}/{max_retries}): {type(e).__name__}: {e}")
-                if attempt == 0:  # Only print full traceback on first attempt
-                    import traceback
-                    traceback.print_exc()
-                
-                if attempt < max_retries - 1:
-                    delay = base_delay * (2 ** attempt)  # Exponential backoff
-                    print(f"⏳ Retrying in {delay:.1f} seconds...")
-                    time.sleep(delay)
-        
-        print(f"💀 All {max_retries} attempts failed for batch of {len(docs)} documents")
-        return None
-
+        return {"count": total_count, "milvus_ids": all_ids}
 
 
 
