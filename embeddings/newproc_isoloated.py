@@ -239,7 +239,7 @@ class ProcessIsolatedONNXProcessor:
         executor = ProcessPoolExecutor(
             max_workers=self.onnx_workers,
             initializer=init_worker_wrapper,
-            initargs=worker_configs
+            initargs=[(worker_id, cpu_cores) for worker_id, cpu_cores in worker_configs]
         )
         
         return executor
