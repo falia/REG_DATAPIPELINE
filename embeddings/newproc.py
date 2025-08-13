@@ -636,15 +636,18 @@ class S3MetadataProcessor:
         writer_results = []
         writer_lock = threading.Lock()
 
-        def writer_worker(idx: int):
-            res = self.store_documents_in_milvus_streaming(docs_q)
-            with writer_lock:
-                writer_results.append(res)
+        def writer_worker():  # ← NO args
+            try:
+                res = self.store_documents_in_milvus_streaming(docs_q)
+                with writer_lock:
+                    writer_results.append(res)
+            except Exception as e:
+                print(f"[{threading.current_thread().name}] writer error: {e}", file=sys.stderr)
 
         writers = []
         for i in range(WRITERS):
             t = threading.Thread(target=writer_worker, name=f"WRITER-{i+1}", daemon=True)
-            t.start()
+            t.start()  # ← start it
             writers.append(t)
 
         # processors
@@ -671,7 +674,7 @@ class S3MetadataProcessor:
         MAX_WORKERS = int(os.getenv("CSSF_MAX_WORKERS", "64"))
         for i in range(MAX_WORKERS):
             t = threading.Thread(target=processor_worker, name=f"PROC-{i+1:02d}", daemon=True)
-            t.start
+            t.start()  # ← this was missing in one earlier version
             processors.append(t)
 
         # enqueue all jobs (mark as "downloaded")
