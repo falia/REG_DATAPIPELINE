@@ -165,6 +165,12 @@ class ParallelismTracker:
             print(f"✅ RESULT [{current_active:2d}] {doc_url[-45:]:45s} ({duration:4.1f}s, {chunk_count} chunks) [Total: {self.total_processed}]")
 
 
+def init_worker_wrapper(config):
+    """Module-level wrapper for worker initialization - MUST be at module level for pickling."""
+    worker_id, cpu_cores = config
+    isolated_onnx_worker_init(worker_id, cpu_cores)
+
+
 class ProcessIsolatedONNXProcessor:
     """Your processor modified to use separate processes for ONNX."""
     
@@ -238,8 +244,8 @@ class ProcessIsolatedONNXProcessor:
         
         executor = ProcessPoolExecutor(
             max_workers=self.onnx_workers,
-            initializer=init_worker_wrapper,
-            initargs=[(worker_id, cpu_cores) for worker_id, cpu_cores in worker_configs]
+            initializer=init_worker_wrapper,  # This is now module-level, so it can be pickled
+            initargs=worker_configs
         )
         
         return executor
