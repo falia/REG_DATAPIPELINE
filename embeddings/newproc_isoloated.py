@@ -61,6 +61,13 @@ def isolated_onnx_worker_init(worker_id: int, cpu_cores: List[int]):
     print(f"🔧 ONNX Worker {worker_id} initialized on cores {cpu_cores} (PID: {os.getpid()})")
 
 
+# ✅ THIS MUST BE AT MODULE LEVEL - NOT INSIDE ANY CLASS!
+def init_worker_wrapper(config):
+    """Module-level wrapper for worker initialization - MUST be at module level for pickling."""
+    worker_id, cpu_cores = config
+    isolated_onnx_worker_init(worker_id, cpu_cores)
+
+
 def process_pdf_in_isolated_worker(args):
     """Process PDF in isolated worker process - this runs in separate process."""
     pdf_content, url, metadata = args
@@ -165,12 +172,6 @@ class ParallelismTracker:
             print(f"✅ RESULT [{current_active:2d}] {doc_url[-45:]:45s} ({duration:4.1f}s, {chunk_count} chunks) [Total: {self.total_processed}]")
 
 
-def init_worker_wrapper(config):
-    """Module-level wrapper for worker initialization - MUST be at module level for pickling."""
-    worker_id, cpu_cores = config
-    isolated_onnx_worker_init(worker_id, cpu_cores)
-
-
 class ProcessIsolatedONNXProcessor:
     """Your processor modified to use separate processes for ONNX."""
     
@@ -237,14 +238,11 @@ class ProcessIsolatedONNXProcessor:
         for worker_id, cores in worker_configs:
             print(f"   Worker {worker_id}: CPU cores {cores[0]}-{cores[-1]}")
         
-        # Create process pool with initialization
-        def init_worker_wrapper(config):
-            worker_id, cpu_cores = config
-            isolated_onnx_worker_init(worker_id, cpu_cores)
-        
+        # ✅ CRITICAL: Use the module-level function, NO local function definition!
+        # Make sure there is NO function definition here inside this method
         executor = ProcessPoolExecutor(
             max_workers=self.onnx_workers,
-            initializer=init_worker_wrapper,  # This is now module-level, so it can be pickled
+            initializer=init_worker_wrapper,  # This must reference the module-level function
             initargs=worker_configs
         )
         
