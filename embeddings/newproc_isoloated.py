@@ -487,7 +487,7 @@ def main():
     MILVUS_CONFIG = {
         "host": "54.217.166.223",
         "port": "19530",
-        "collection_name": "cssf_documents_final_final_CGDEM101",
+        "collection_name": "CG_DEMO",
         "connection_args": {"host": "54.217.166.223", "port": "19530"},
     }
 
