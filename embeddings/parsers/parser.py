@@ -98,26 +98,32 @@ class CSSFHTMLParser(DocumentParser):
 
 
 class PDFParserPipeline(DocumentParser):
-    """Two-step pipeline:
-       1) Redact headers/footers to a TEMP sanitized PDF (PyMuPDF)
-       2) Parse sanitized PDF with Unstructured ONNX (no chunking inside)
-    """
 
     def __init__(
         self,
-        redactor: HeaderFooterRedactor | None = None,
-        pdf_parser: ONNXPDFParser | None = None,
+        redactor: "HeaderFooterRedactor | None" = None,
+        pdf_parser: "ONNXPDFParser | None" = None,
+        enable_redaction: bool = False,   # <-- default OFF
     ):
-        self.redactor = redactor or HeaderFooterRedactor(
-            top_k=5, bottom_k=3, win=8,
-            header_th=0.65, footer_th=0.65, rank_th=0.55,
-            pad=2.0, black=True,
-        )
-        self.pdf_parser = pdf_parser or ONNXPDFParser()  # ensure this uses chunking_strategy=None
+        # Toggle via param or env var
+        env_disable = os.getenv("DISABLE_PDF_REDACTION", "1").lower() in ("1", "true", "yes")
+        self.enable_redaction = enable_redaction and not env_disable
 
-    def can_process(self, url: str, content_type: str = None) -> bool:
+        # Only build a redactor if we actually plan to use it
+        self.redactor = None
+        if self.enable_redaction:
+            self.redactor = redactor or HeaderFooterRedactor(
+                top_k=5, bottom_k=3, win=8,
+                header_th=0.65, footer_th=0.65, rank_th=0.55,
+                pad=2.0, black=True,
+            )
+
+        # Make sure your ONNX parser does not chunk internally
+        self.pdf_parser = pdf_parser or ONNXPDFParser()  # should use chunking_strategy=None
+
+    def can_process(self, url: str, content_type: str | None = None) -> bool:
         url_match = url.lower().endswith(".pdf")
-        content_type_match = content_type and "application/pdf" in content_type
+        content_type_match = bool(content_type and "application/pdf" in content_type.lower())
         return url_match or content_type_match
 
     def parse(self, content: bytes, url: str, content_type: str) -> List[Element]:
@@ -128,12 +134,23 @@ class PDFParserPipeline(DocumentParser):
 
         sanitized_path = None
         try:
-            # Step 1: redact to a temp copy
-            sanitized_path = self.redactor.redact_to_temp(orig_path)
-            # Step 2: parse sanitized copy with ONNX Unstructured (must return raw elements)
-            return self.pdf_parser.parse_file(sanitized_path)
+            # If redaction is enabled, try it; otherwise parse the original file
+            if self.enable_redaction and self.redactor is not None:
+                try:
+                    sanitized_path = self.redactor.redact_to_temp(orig_path)
+                    path_to_parse = sanitized_path
+                except Exception as e:
+                    # Fallback to original if redaction fails
+                    print(f"[PDFParserPipeline] Redaction failed ({e}); using original PDF.")
+                    path_to_parse = orig_path
+            else:
+                # Redaction disabled: work with headers/footers as-is
+                path_to_parse = orig_path
+
+            return self.pdf_parser.parse_file(path_to_parse)
+
         finally:
-            # Clean up temps
+            # Clean up temps (avoid deleting the same path twice)
             for p in (orig_path, sanitized_path):
                 if p and os.path.exists(p):
                     try:

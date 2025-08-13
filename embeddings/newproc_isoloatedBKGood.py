@@ -384,48 +384,6 @@ class ProcessIsolatedONNXPipeline:
             except Exception as e:
                 print(f"❌ Error with metadata file {s3_key}: {e}")
 
-    # -------------------------
-    # NEW: scheduling helpers
-    # -------------------------
-    def _extract_s3_key(self, s3_uri: str) -> str:
-        if not s3_uri:
-            return ""
-        prefix = f"s3://{self.s3_bucket}/"
-        return s3_uri[len(prefix):] if s3_uri.startswith(prefix) else s3_uri
-
-    def _s3_head_size(self, key: str) -> int:
-        try:
-            h = self.s3.head_object(Bucket=self.s3_bucket, Key=key)
-            return int(h.get("ContentLength", 0))
-        except Exception:
-            return 0
-
-    def _priority_for_sort(self, file_info: Dict[str, Any]) -> Tuple[int, int]:
-        """
-        Sort key: non-PDF first (flag=0); PDFs last (flag=1) ordered ascending by S3 ContentLength.
-        Unknown PDF sizes are sent to the back of the PDF group.
-        """
-        url = (file_info or {}).get("url", "") or ""
-        content_type = (file_info or {}).get("content_type", "") or ""
-        s3_uri = (file_info or {}).get("s3_uri", "") or ""
-        is_pdf = _is_pdf(url, content_type)
-
-        if not is_pdf:
-            # Non-PDFs always first; keep secondary as 0
-            return (0, 0)
-
-        key = self._extract_s3_key(s3_uri)
-        size = self._s3_head_size(key) if key else 0
-        return (1, size if size > 0 else 1_000_000_000)
-
-    def _collect_sorted_tasks(self, session_id: str) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
-        """
-        Collect all tasks, then sort so non-PDFs go first, PDFs last sorted by ascending size.
-        """
-        tasks: List[Tuple[Dict[str, Any], Dict[str, Any]]] = [(fi, md) for (fi, md) in self._iter_session_files(session_id)]
-        tasks.sort(key=lambda t: self._priority_for_sort(t[0]))
-        return tasks
-
     # --------------------------
     # Continuous streaming runner
     # --------------------------
@@ -438,16 +396,15 @@ class ProcessIsolatedONNXPipeline:
         start_time = time.time()
         total_chunks_stored = 0
 
-        # NEW: collect & sort tasks so that PDFs are pushed to the end (smallest-first within PDFs)
-        tasks = self._collect_sorted_tasks(session_id)
-        task_idx = 0
-        n_tasks = len(tasks)
+        task_iter = self._iter_session_files(session_id)
         inflight: dict = {}  # fut -> (file_info, base_md)
 
-        # Prime the pool from sorted task list
-        for _ in range(min(self.max_workers, n_tasks)):
-            file_info, base_md = tasks[task_idx]
-            task_idx += 1
+        # Prime the pool
+        for _ in range(self.max_workers):
+            try:
+                file_info, base_md = next(task_iter)
+            except StopIteration:
+                break
             url = file_info.get("url", "unknown")
             self.tracker.start(url)
             fut = self._executor.submit(
@@ -458,7 +415,7 @@ class ProcessIsolatedONNXPipeline:
             )
             inflight[fut] = (file_info, base_md)
 
-        # Drain/Refill loop
+        # Drain/Refill loop: when one finishes, submit the next file immediately
         while inflight:
             done, _ = wait(set(inflight.keys()), return_when=FIRST_COMPLETED)
             for fut in done:
@@ -484,19 +441,20 @@ class ProcessIsolatedONNXPipeline:
                     self.tracker.finish(url, 0)
                     print(f"❌ Error processing {url}: {e}")
 
-                # Refill next task in sorted order
-                if task_idx < n_tasks:
-                    file_info2, base_md2 = tasks[task_idx]
-                    task_idx += 1
-                    url2 = file_info2.get("url", "unknown")
+                # Refill one slot
+                try:
+                    file_info, base_md = next(task_iter)
+                    url2 = file_info.get("url", "unknown")
                     self.tracker.start(url2)
                     fut2 = self._executor.submit(
                         parse_and_chunk_worker,
-                        self.s3_bucket, file_info2, base_md2,
+                        self.s3_bucket, file_info, base_md,
                         self.hi_res_model_name, self.omp_threads,
                         {"max_chunk_size": 1800, "overlap": 200},
                     )
-                    inflight[fut2] = (file_info2, base_md2)
+                    inflight[fut2] = (file_info, base_md)
+                except StopIteration:
+                    pass
 
         # Wrap up
         self._executor.shutdown(wait=True)
