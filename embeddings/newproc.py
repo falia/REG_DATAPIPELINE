@@ -2,18 +2,19 @@ import json
 import boto3
 import hashlib
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from langchain_core.documents import Document
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from functools import partial
+import queue
+import time
 
 from embeddings.embedding_provider.embedding_provider import EmbeddingService
 from embeddings.chunker.document_chunker import DocumentChunker
 from embeddings.parsers.parser import EurlexHTMLParser, CSSFHTMLParser, PDFParserPipeline, DocumentProcessor
 
 
-# --- only the fields you said you want (plus vector/text/doc_id used by the store) ---
 ALLOWED_FIELDS = {
     "text", "vector", "doc_id",
     "url", "title", "subtitle", "document_type", "document_number",
@@ -23,20 +24,31 @@ ALLOWED_FIELDS = {
 }
 
 
-class S3MetadataProcessor:
-    def __init__(self, s3_bucket: str, session_id: Optional[str] = None, milvus_config: Optional[Dict] = None, max_workers: int = 4):
+class DocumentLevelProcessor:
+    """Process individual documents in parallel instead of files."""
+    
+    def __init__(self, s3_bucket: str, session_id: Optional[str] = None, 
+                 milvus_config: Optional[Dict] = None, max_concurrent_documents: int = 15):
         self.s3_bucket = s3_bucket
         self.session_id = session_id
-        self.s3 = boto3.client("s3")
-        self.max_workers = max_workers  # Number of parallel workers for PDF processing
+        self.max_concurrent_documents = max_concurrent_documents
         
-        # Thread-local storage for parsers to avoid sharing issues
+        self.s3 = boto3.client("s3")
+        
+        # Thread-local storage for parsers (each thread gets its own)
         self._local = threading.local()
-
+        
+        # Shared chunker and embedding service
         self.chunker = DocumentChunker(max_chunk_size=1800, overlap=200)
+        
+        # Thread-safe deduplication
         self.seen_hashes: set[str] = set()
-        self._seen_hashes_lock = threading.Lock()  # Thread-safe access to seen_hashes
-
+        self._seen_hashes_lock = threading.Lock()
+        
+        # ONNX threading optimization - limit threads per session
+        # 15 concurrent docs × 4 ONNX threads = 60 total (reasonable for 64 vCPUs)
+        self.onnx_threads_per_document = 4
+        
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
 
@@ -54,17 +66,80 @@ class S3MetadataProcessor:
             endpoint_name="embedding-endpoint",
             region_name="eu-west-1",
         )
+        
+        self.logger.info(f"Configured for {max_concurrent_documents} concurrent documents, "
+                        f"{self.onnx_threads_per_document} ONNX threads per document")
 
     def _get_processor(self):
-        """Get thread-local processor instance to avoid sharing between threads."""
+        """Get thread-local processor instance with your existing ONNX code."""
         if not hasattr(self._local, 'processor'):
-            self._local.processor = DocumentProcessor(
-                parsers=[EurlexHTMLParser(), CSSFHTMLParser(), PDFParserPipeline()]
-            )
+            # Import your existing ONNX parser
+            from embeddings.parsers.ONNXPDFParser import ONNXPDFParser
+            from embeddings.parsers.PDFRemoveHeaderFooter import HeaderFooterRedactor
+            
+            # Create optimized PDF pipeline using your existing code
+            class OptimizedPDFPipeline:
+                def __init__(self, onnx_threads: int):
+                    self.onnx_threads = onnx_threads
+                    self.redactor = HeaderFooterRedactor(
+                        top_k=5, bottom_k=3, win=8,
+                        header_th=0.65, footer_th=0.65, rank_th=0.55,
+                        pad=2.0, black=True,
+                    )
+                    # Use your existing ONNXPDFParser
+                    self.pdf_parser = ONNXPDFParser()
+
+                def can_process(self, url: str, content_type: str = None) -> bool:
+                    url_match = url.lower().endswith(".pdf")
+                    content_type_match = content_type and "application/pdf" in content_type
+                    return url_match or content_type_match
+
+                def parse(self, content: bytes, url: str, content_type: str):
+                    """Parse with controlled ONNX threading using your existing code."""
+                    import os
+                    import tempfile
+                    
+                    # Set ONNX threading for this document
+                    original_omp = os.environ.get('OMP_NUM_THREADS')
+                    os.environ['OMP_NUM_THREADS'] = str(self.onnx_threads)
+                    
+                    try:
+                        # Write original bytes to temp file
+                        with tempfile.NamedTemporaryFile(mode="wb", suffix=".pdf", delete=False) as tmp:
+                            tmp.write(content)
+                            orig_path = tmp.name
+
+                        sanitized_path = None
+                        try:
+                            # Step 1: redact headers/footers (your existing code)
+                            sanitized_path = self.redactor.redact_to_temp(orig_path)
+                            # Step 2: parse with your existing ONNXPDFParser
+                            return self.pdf_parser.parse_file(sanitized_path)
+                        finally:
+                            # Cleanup
+                            for p in (orig_path, sanitized_path):
+                                if p and os.path.exists(p):
+                                    try:
+                                        os.unlink(p)
+                                    except Exception:
+                                        pass
+                    finally:
+                        # Restore environment
+                        if original_omp is not None:
+                            os.environ['OMP_NUM_THREADS'] = original_omp
+                        elif 'OMP_NUM_THREADS' in os.environ:
+                            del os.environ['OMP_NUM_THREADS']
+            
+            # Create thread-local processor with your existing parsers
+            self._local.processor = DocumentProcessor(parsers=[
+                EurlexHTMLParser(), 
+                CSSFHTMLParser(), 
+                OptimizedPDFPipeline(self.onnx_threads_per_document)
+            ])
         return self._local.processor
 
-    # ---------------- util ----------------
-
+    # ===== Utility Methods (same as before) =====
+    
     def list_sessions(self) -> List[str]:
         try:
             resp = self.s3.list_objects_v2(Bucket=self.s3_bucket, Prefix="", Delimiter="/")
@@ -95,7 +170,7 @@ class S3MetadataProcessor:
                         out.append(obj["Key"])
             return out
         except Exception as e:
-            self.logger.error(f"Error listing metadata files for session {session_id}: {e}", exc_info=True)
+            self.logger.error(f"Error listing metadata files for session {session_id}: {e}")
             return []
 
     def read_metadata_from_s3(self, s3_key: str) -> Dict[str, Any]:
@@ -115,8 +190,8 @@ class S3MetadataProcessor:
             self.logger.error(f"Error downloading document from {s3_uri}: {e}")
             return b""
 
-    # ---------------- metadata shaping (ONLY your fields + page_number) ----------------
-
+    # ===== Metadata Processing (same as before) =====
+    
     @staticmethod
     def _clamp(s: Any, n: int) -> str:
         s = "" if s is None else str(s)
@@ -135,7 +210,6 @@ class S3MetadataProcessor:
         return default
 
     def flatten_metadata_for_search(self, metadata: dict, page_number: int | None = None) -> dict:
-        """Return only the fields you want; arrays kept as JSON; include page_number if provided."""
         md = {
             "url": self._clamp(metadata.get("url", ""), 1000),
             "title": self._clamp(metadata.get("title", ""), 1000),
@@ -150,7 +224,6 @@ class S3MetadataProcessor:
             "lang": self._clamp(metadata.get("lang", ""), 10),
             "super_category": self._clamp(metadata.get("super_category", ""), 100),
             "crawl_session": self._clamp(metadata.get("crawl_session", ""), 50),
-            # JSON columns
             "top_related": self._as_json(metadata.get("top_related", []), []),
             "bottom_related": self._as_json(metadata.get("bottom_related", []), []),
             "themes": self._as_json(metadata.get("themes", []), []),
@@ -170,11 +243,9 @@ class S3MetadataProcessor:
 
     @staticmethod
     def _ensure_required_fields(meta: Dict[str, Any], text: str) -> Dict[str, Any]:
-        # doc_id must exist
         if not meta.get("doc_id"):
             base = (meta.get("url", "") + str(meta.get("page_number", 0)) + text).encode("utf-8")
             meta["doc_id"] = hashlib.sha256(base).hexdigest()
-        # page_number default
         try:
             meta["page_number"] = int(meta.get("page_number", 0))
         except Exception:
@@ -183,36 +254,22 @@ class S3MetadataProcessor:
 
     @staticmethod
     def _extract_page_number(doc: Document) -> int:
-        # If the chunker preserved page_number, use it; else 0
         try:
             pn = doc.metadata.get("page_number", 0) if isinstance(doc.metadata, dict) else 0
             return int(pn) if pn is not None else 0
         except Exception:
             return 0
 
-    # ---------------- pipeline ----------------
-
     def hash_document(self, doc: Document) -> str:
         base = (doc.page_content + str(doc.metadata.get("url", "")) + str(doc.metadata.get("page_number", 0))).encode("utf-8")
         return hashlib.sha256(base).hexdigest()
 
-    def convert_elements_to_documents(self, elements, base_meta: Dict[str, Any]) -> List[Document]:
-        """(Unused when chunking; kept for completeness)."""
-        docs: List[Document] = []
-        for i, el in enumerate(elements):
-            try:
-                txt = (getattr(el, "text", None) or getattr(el, "page_content", None) or str(el)).strip()
-                if not txt:
-                    continue
-                pn = getattr(getattr(el, "metadata", None), "page_number", None)
-                meta = self.flatten_metadata_for_search(base_meta, page_number=pn if isinstance(pn, int) else 0)
-                docs.append(Document(page_content=txt, metadata=meta))
-            except Exception as e:
-                self.logger.error(f"Error converting element {i}: {e}")
-        return docs
-
-    def process_single_file(self, file_info: dict, metadata: Dict[str, Any]) -> List[Document]:
-        """Process a single file and return documents. Thread-safe."""
+    # ===== NEW: Document-Level Processing =====
+    
+    def process_single_document(self, document_info: Tuple[dict, Dict[str, Any]]) -> List[Document]:
+        """Process a single document. This is what runs in parallel."""
+        file_info, base_metadata = document_info
+        
         try:
             s3_uri = file_info.get("s3_uri")
             original_url = file_info.get("url")
@@ -222,89 +279,107 @@ class S3MetadataProcessor:
                 return []
 
             self.logger.info(f"Processing document: {original_url}")
+            
+            # Download document
             content = self.download_document_from_s3(s3_uri)
             if not content:
                 return []
 
-            # Use thread-local processor
+            # Process with thread-local processor (includes ONNX threading control)
             processor = self._get_processor()
             elements = processor.process(content, original_url, content_type)
 
-            # chunk
+            # Chunk
             chunked_docs = self.chunker.chunk_document(elements, original_url)
 
-            # replace each chunk's metadata with ONLY your flattened fields (+ page_number if present)
-            for d in chunked_docs:
-                pn = self._extract_page_number(d)
-                d.metadata = self.flatten_metadata_for_search(metadata, page_number=pn)
+            # Apply metadata to each chunk
+            processed_docs = []
+            for doc in chunked_docs:
+                pn = self._extract_page_number(doc)
+                doc.metadata = self.flatten_metadata_for_search(base_metadata, page_number=pn)
+                processed_docs.append(doc)
                 
-            return chunked_docs
+            self.logger.info(f"Completed document: {original_url} - {len(processed_docs)} chunks")
+            return processed_docs
 
         except Exception as e:
             self.logger.error(f"Error processing document {file_info.get('url','unknown')}: {e}")
             return []
 
-    def process_document(self, metadata: Dict[str, Any]) -> List[Document]:
-        """Download & parse every referenced file, chunk, and attach only your fields. Now with parallel processing."""
-        all_docs: List[Document] = []
-        files_to_process = metadata.get("top_related", [])
+    def collect_all_documents_from_metadata_files(self, metadata_files: List[str], session_id: str) -> List[Tuple[dict, Dict[str, Any]]]:
+        """Collect all individual documents from all metadata files."""
+        all_documents = []
         
-        if not files_to_process:
-            return all_docs
-            
-        # Separate PDF and non-PDF files
-        pdf_files = [f for f in files_to_process if f.get("url", "").lower().endswith(".pdf") or 
-                     f.get("content_type", "").startswith("application/pdf")]
-        other_files = [f for f in files_to_process if f not in pdf_files]
-        
-        # Process non-PDF files sequentially (they're usually faster)
-        for file_info in other_files:
-            docs = self.process_single_file(file_info, metadata)
-            all_docs.extend(docs)
-        
-        # Process PDF files in parallel
-        if pdf_files:
-            self.logger.info(f"Processing {len(pdf_files)} PDF files in parallel with {self.max_workers} workers")
-            
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                # Submit all PDF processing tasks
-                future_to_file = {
-                    executor.submit(self.process_single_file, file_info, metadata): file_info
-                    for file_info in pdf_files
-                }
+        for metadata_file in metadata_files:
+            try:
+                metadata = self.read_metadata_from_s3(metadata_file)
+                if not metadata:
+                    continue
+                    
+                metadata["crawl_session"] = session_id
                 
-                # Collect results as they complete
-                for future in as_completed(future_to_file):
-                    file_info = future_to_file[future]
-                    try:
-                        docs = future.result()
-                        all_docs.extend(docs)
+                # Extract all documents from this metadata file
+                for file_info in metadata.get("top_related", []):
+                    all_documents.append((file_info, metadata))
+                    
+            except Exception as e:
+                self.logger.error(f"Error reading metadata {metadata_file}: {e}")
+                
+        return all_documents
+
+    def process_documents_in_parallel(self, all_documents: List[Tuple[dict, Dict[str, Any]]]) -> List[Document]:
+        """Process documents in parallel - this is the key change!"""
+        
+        all_processed_docs = []
+        total_documents = len(all_documents)
+        
+        self.logger.info(f"Processing {total_documents} documents with {self.max_concurrent_documents} workers")
+        
+        with ThreadPoolExecutor(max_workers=self.max_concurrent_documents) as executor:
+            # Submit all document processing tasks
+            future_to_doc = {
+                executor.submit(self.process_single_document, doc_info): doc_info
+                for doc_info in all_documents
+            }
+            
+            completed_count = 0
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_doc):
+                doc_info = future_to_doc[future]
+                try:
+                    docs = future.result()
+                    all_processed_docs.extend(docs)
+                    completed_count += 1
+                    
+                    if completed_count % 10 == 0:  # Progress logging
+                        self.logger.info(f"Completed {completed_count}/{total_documents} documents")
                         
+                except Exception as e:
+                    file_info, _ = doc_info
+                    self.logger.error(f"Failed to process document {file_info.get('url', 'unknown')}: {e}")
 
-                    except Exception as e:
-                        self.logger.error(f"Failed to process PDF {file_info.get('url', 'unknown')}: {e}")
-                        return []
-
-        return all_docs
+        self.logger.info(f"Completed all {total_documents} documents, generated {len(all_processed_docs)} chunks")
+        return all_processed_docs
 
     def store_documents_in_milvus(self, documents: List[Document]) -> Dict[str, Any]:
+        """Store documents in Milvus with thread-safe deduplication."""
         if not documents:
             return {"count": 0, "milvus_ids": []}
 
         new_docs, texts, metas = [], [], []
 
         for d in documents:
-            # make sure required fields exist & metadata only contains schema fields
             meta = self._ensure_required_fields(self._filter_to_schema(dict(d.metadata or {})), d.page_content)
 
-            # dedupe (thread-safe)
+            # Thread-safe deduplication
             doc_hash = self.hash_document(Document(page_content=d.page_content, metadata=meta))
             with self._seen_hashes_lock:
                 if doc_hash in self.seen_hashes:
                     continue
                 self.seen_hashes.add(doc_hash)
                 
-            meta["doc_id"] = doc_hash  # use this as the doc_id you store
+            meta["doc_id"] = doc_hash
 
             new_docs.append(d)
             texts.append(d.page_content)
@@ -322,35 +397,39 @@ class S3MetadataProcessor:
             return {"count": 0, "milvus_ids": []}
 
     def process_session(self, session_id: str) -> Dict[str, Any]:
+        """Main processing method - now with document-level parallelism."""
         self.logger.info(f"Processing session: {session_id}")
-        keys = self.get_session_metadata_files(session_id)
-        print("Meta data files to process ---------------------------------------------------------", len(keys))
+        
+        # Get all metadata files
+        metadata_files = self.get_session_metadata_files(session_id)
+        self.logger.info(f"Found {len(metadata_files)} metadata files")
 
-        if not keys:
+        if not metadata_files:
             self.logger.warning(f"No metadata files found for session {session_id}")
             return {"processed": 0, "stored": 0, "errors": 0}
 
-        total_processed = total_stored = total_errors = 0
+        # Collect all individual documents from all metadata files
+        all_documents = self.collect_all_documents_from_metadata_files(metadata_files, session_id)
+        self.logger.info(f"Collected {len(all_documents)} total documents to process")
 
-        for k in keys:
-            try:
-                md = self.read_metadata_from_s3(k)
-                if not md:
-                    continue
-                md["crawl_session"] = session_id
-
-                docs = self.process_document(md)
-                total_processed += len(docs)
-
-                res = self.store_documents_in_milvus(docs)
-                total_stored += res["count"]
-
-                self.logger.info(f"Processed {k}: {len(docs)} docs, {res['count']} stored")
-            except Exception as e:
-                self.logger.error(f"Error processing {k}: {e}")
-                total_errors += 1
-
-        summary = {"session_id": session_id, "processed": total_processed, "stored": total_stored, "errors": total_errors}
+        # Process all documents in parallel (THIS IS THE KEY CHANGE!)
+        start_time = time.time()
+        processed_docs = self.process_documents_in_parallel(all_documents)
+        processing_time = time.time() - start_time
+        
+        # Store all results
+        result = self.store_documents_in_milvus(processed_docs)
+        
+        summary = {
+            "session_id": session_id,
+            "metadata_files": len(metadata_files),
+            "total_documents": len(all_documents),
+            "processed_chunks": len(processed_docs),
+            "stored": result["count"],
+            "processing_time_seconds": processing_time,
+            "documents_per_minute": (len(all_documents) / processing_time) * 60 if processing_time > 0 else 0
+        }
+        
         self.logger.info(f"Session {session_id} complete: {summary}")
         return summary
 
@@ -372,12 +451,12 @@ def main():
         "connection_args": {"host": "54.217.166.223", "port": "19530"},
     }
 
-    # Increase max_workers for more parallelism (adjust based on your resources)
-    processor = S3MetadataProcessor(
+    # Create processor with document-level parallelism
+    processor = DocumentLevelProcessor(
         s3_bucket=S3_BUCKET,
         session_id=SESSION_ID,
         milvus_config=MILVUS_CONFIG,
-        max_workers=16,  # Adjust this based on your system capabilities
+        max_concurrent_documents=15,  # 15 documents in parallel!
     )
 
     sessions = processor.list_sessions()
@@ -385,13 +464,13 @@ def main():
 
     most_recent = processor.get_most_recent_session()
     if most_recent:
-        print(f"Most recent session: {most_recent}")
+        print(f"Processing session: {most_recent}")
         result = processor.process_session(most_recent)
         print(f"Processing complete: {result}")
+        print(f"Throughput: {result.get('documents_per_minute', 0):.1f} documents/minute")
     else:
         print("No sessions found to process")
 
 
 if __name__ == "__main__":
     main()
-              
