@@ -221,32 +221,30 @@ class ProcessIsolatedONNXProcessor:
         print(f"🚀 Process-isolated processor: {max_concurrent_documents} workers, {onnx_workers} ONNX processes, {batch_size} batch size")
 
     def _create_isolated_worker_pool(self):
-        """Create pool of isolated ONNX worker processes with dedicated CPU cores."""
+        """Create pool with fewer workers to avoid memory issues."""
         
-        # Allocate CPU cores to workers (m7i.16xlarge has 64 vCPUs)
-        # Reserve first 16 cores for main process, use remaining 48 for ONNX workers
-        cores_per_worker = 48 // self.onnx_workers  # 6 cores per worker if 8 workers
+        # ✅ Use fewer cores per worker to reduce memory pressure
+        cores_per_worker = 48 // self.onnx_workers  # 12 cores per worker if 4 workers
         
         worker_configs = []
         for i in range(self.onnx_workers):
-            start_core = 16 + (i * cores_per_worker)  # Start from core 16
+            start_core = 16 + (i * cores_per_worker)
             end_core = start_core + cores_per_worker - 1
-            cpu_cores = list(range(start_core, end_core + 1))
+            cpu_cores = list(range(start_core, min(end_core + 1, 64)))  # Don't exceed available cores
             worker_configs.append((i, cpu_cores))
         
-        print(f"🏗️  Creating {self.onnx_workers} isolated ONNX workers:")
+        print(f"🏗️  Creating {self.onnx_workers} memory-safe ONNX workers:")
         for worker_id, cores in worker_configs:
             print(f"   Worker {worker_id}: CPU cores {cores[0]}-{cores[-1]}")
         
-        # ✅ CRITICAL: Use the module-level function, NO local function definition!
-        # Make sure there is NO function definition here inside this method
         executor = ProcessPoolExecutor(
             max_workers=self.onnx_workers,
-            initializer=init_worker_wrapper,  # This must reference the module-level function
+            initializer=init_worker_wrapper,
             initargs=worker_configs
         )
         
         return executor
+
 
     def _get_non_pdf_processor(self):
         """Get thread-local processor for non-PDF documents (main process)."""
@@ -287,15 +285,15 @@ class ProcessIsolatedONNXProcessor:
         except:
             return b""
 
+
     def process_single_document(self, document_info: Tuple[dict, Dict[str, Any]]) -> List[Document]:
-        """Process single document using isolated ONNX workers."""
+        """Process with error recovery and pool recreation."""
         file_info, base_metadata = document_info
         
         s3_uri = file_info.get("s3_uri")
         original_url = file_info.get("url", "unknown")
         content_type = file_info.get("content_type", "application/octet-stream")
         
-        # Check if it's a PDF
         is_pdf = (original_url.lower().endswith(".pdf") or 
                  (content_type and "application/pdf" in content_type.lower()))
         
@@ -308,22 +306,44 @@ class ProcessIsolatedONNXProcessor:
                 return []
 
             if is_pdf:
-                # Use isolated ONNX worker process for PDFs
                 self.tracker.start_doc(original_url)
                 
-                # Submit to isolated worker process
-                future = self.onnx_executor.submit(
-                    process_pdf_in_isolated_worker, 
-                    (content, original_url, base_metadata)
-                )
+                # ✅ Add retry logic for crashed process pool
+                max_retries = 2
+                for attempt in range(max_retries):
+                    try:
+                        future = self.onnx_executor.submit(
+                            process_pdf_in_isolated_worker, 
+                            (content, original_url, base_metadata)
+                        )
+                        
+                        # Add timeout to prevent hanging
+                        serialized_docs = future.result(timeout=120)  # 2 minute timeout
+                        break
+                        
+                    except Exception as e:
+                        if "process pool is not usable" in str(e) or "child process terminated" in str(e):
+                            print(f"🔄 Worker pool crashed, recreating... (attempt {attempt + 1}/{max_retries})")
+                            
+                            # Recreate the process pool
+                            try:
+                                self.onnx_executor.shutdown(wait=False)
+                            except:
+                                pass
+                            
+                            self.onnx_executor = self._create_isolated_worker_pool()
+                            
+                            if attempt == max_retries - 1:
+                                print(f"❌ Failed to process {original_url} after {max_retries} attempts")
+                                return []
+                        else:
+                            raise e
+                else:
+                    return []
                 
-                # Get result from isolated process
-                serialized_docs = future.result()
-                
-                # Convert back to Document objects with proper metadata
+                # Convert back to Document objects
                 processed_docs = []
                 for doc_data in serialized_docs:
-                    # Apply proper metadata flattening
                     raw_metadata = doc_data['metadata']
                     pn = doc_data.get('page_number', 0)
                     flattened_metadata = self.flatten_metadata_for_search(base_metadata, page_number=pn)
@@ -337,15 +357,13 @@ class ProcessIsolatedONNXProcessor:
                 return processed_docs
                 
             else:
-                # Use regular processor for non-PDFs (main process)
+                # Use regular processor for non-PDFs
                 self.tracker.start_doc(original_url)
                 processor = self._get_non_pdf_processor()
                 elements = processor.process(content, original_url, content_type)
                 
-                # Chunk in main process
                 chunked_docs = self.chunker.chunk_document(elements, original_url)
                 
-                # Apply metadata in main process with proper flattening
                 processed_docs = []
                 for doc in chunked_docs:
                     pn = self._extract_page_number(doc)
@@ -360,7 +378,6 @@ class ProcessIsolatedONNXProcessor:
             return []
         finally:
             self.tracker.finish_doc(original_url, len(processed_docs) if 'processed_docs' in locals() else 0)
-
     @staticmethod
     def _extract_page_number(doc: Document) -> int:
         # If the chunker preserved page_number, use it; else 0
@@ -560,7 +577,7 @@ class ProcessIsolatedONNXProcessor:
         md = {
             "url": self._clamp(metadata.get("url", ""), 1000),
             "title": self._clamp(metadata.get("title", ""), 1000),
-            "subtitle": self._clamp(metadata.get("subtitle", ""), 500),
+            "subtitle": self._clamp(metadata.get("subtitle", ""), 100),
             "document_type": self._clamp(metadata.get("document_type", ""), 100),
             "document_number": self._clamp(metadata.get("document_number", ""), 100),
             "publication_date": self._clamp(metadata.get("publication_date") or "", 50),
