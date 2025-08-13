@@ -2,6 +2,7 @@ import json
 import boto3
 import hashlib
 import logging
+import queue
 import threading
 import time
 import os
@@ -11,6 +12,9 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from langchain_core.documents import Document
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+
+_worker_assignment_lock = threading.Lock()
+_next_worker_id = 0
 
 # DISABLE ALL NOISE LOGGING
 logging.getLogger('boto3').setLevel(logging.CRITICAL)
@@ -22,6 +26,9 @@ logging.getLogger('embeddings').setLevel(logging.CRITICAL)
 from embeddings.embedding_provider.embedding_provider import EmbeddingService
 from embeddings.chunker.document_chunker import DocumentChunker
 from embeddings.parsers.parser import EurlexHTMLParser, CSSFHTMLParser, DocumentProcessor
+
+
+
 
 
 # ISOLATED ONNX WORKER FUNCTION (runs in separate process)
@@ -171,13 +178,122 @@ class ParallelismTracker:
             
             print(f"✅ RESULT [{current_active:2d}] {doc_url[-45:]:45s} ({duration:4.1f}s, {chunk_count} chunks) [Total: {self.total_processed}]")
 
+def get_next_worker_config(all_configs):
+    """Thread-safe round-robin worker assignment."""
+    global _next_worker_id
+    with _worker_assignment_lock:
+        config = all_configs[_next_worker_id % len(all_configs)]
+        _next_worker_id += 1
+        return config
+
+def process_pdf_with_dynamic_worker_init(args):
+    """Process PDF with dynamic worker selection - each process initializes once."""
+    pdf_content, url, metadata, all_worker_configs = args
+    
+    # Check if this process is already initialized
+    if not hasattr(process_pdf_with_dynamic_worker_init, '_process_initialized'):
+        # This process hasn't been initialized yet
+        try:
+            # Get the next available worker config
+            worker_id, cpu_cores = get_next_worker_config(all_worker_configs)
+            
+            # Initialize this process with the assigned config
+            isolated_onnx_worker_init(worker_id, cpu_cores)
+            
+            # Mark this process as initialized
+            process_pdf_with_dynamic_worker_init._process_initialized = True
+            process_pdf_with_dynamic_worker_init._worker_id = worker_id
+            
+            print(f"🔧 Process {os.getpid()} initialized as Worker {worker_id}")
+            
+        except Exception as e:
+            print(f"❌ Failed to initialize process {os.getpid()}: {e}")
+            return []
+    
+    # Now use the initialized ONNX components
+    try:
+        global worker_id_global, onnx_parser, redactor, chunker
+        
+        if not all([onnx_parser, redactor, chunker]):
+            print(f"❌ Process {os.getpid()}: ONNX components not available")
+            return []
+        
+        print(f"🟢 Worker {worker_id_global}: Processing {url[-40:]} (PID: {os.getpid()})")
+        
+        # File size check
+        if len(pdf_content) > 50 * 1024 * 1024:  # 50MB limit
+            print(f"⚠️  Worker {worker_id_global}: File too large ({len(pdf_content)/1024/1024:.1f}MB), skipping")
+            return []
+        
+        # Process PDF
+        import tempfile
+        import gc
+        
+        temp_path = None
+        sanitized_path = None
+        
+        try:
+            # Write PDF to temp file
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+                tmp.write(pdf_content)
+                temp_path = tmp.name
+            
+            # Clear content from memory
+            del pdf_content
+            gc.collect()
+            
+            # Process with ONNX
+            sanitized_path = redactor.redact_to_temp(temp_path)
+            elements = onnx_parser.parse_file(sanitized_path)
+            
+            # Chunk the document
+            docs = chunker.chunk_document(elements, url)
+            
+            # Clear intermediate data
+            del elements
+            gc.collect()
+            
+            # Convert to serializable format
+            result = []
+            for doc in docs:
+                pn = 0
+                try:
+                    if hasattr(doc, 'metadata') and doc.metadata:
+                        pn = int(doc.metadata.get("page_number", 0))
+                except:
+                    pn = 0
+                
+                result.append({
+                    'content': doc.page_content,
+                    'metadata': dict(doc.metadata) if hasattr(doc, 'metadata') and doc.metadata else {},
+                    'page_number': pn
+                })
+            
+            print(f"✅ Worker {worker_id_global}: Completed {url[-40:]} -> {len(result)} chunks")
+            return result
+            
+        finally:
+            # Cleanup temp files
+            for path in [temp_path, sanitized_path]:
+                if path and os.path.exists(path):
+                    try:
+                        os.unlink(path)
+                    except:
+                        pass
+            gc.collect()
+                        
+    except Exception as e:
+        print(f"❌ Worker: Error processing {url}: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
 
 class ProcessIsolatedONNXProcessor:
-    """Your processor modified to use separate processes for ONNX."""
+    """Fixed multiprocessing processor."""
     
     def __init__(self, s3_bucket: str, session_id: Optional[str] = None, 
                  milvus_config: Optional[Dict] = None, max_concurrent_documents: int = 15,
-                 onnx_workers: int = 8, batch_size: int = 30):
+                 onnx_workers: int = 6, batch_size: int = 30):  # Reduce to 6 workers
         self.s3_bucket = s3_bucket
         self.session_id = session_id
         self.max_concurrent_documents = max_concurrent_documents
@@ -187,20 +303,21 @@ class ProcessIsolatedONNXProcessor:
         self.s3 = boto3.client("s3")
         self.tracker = ParallelismTracker()
         
-        # Create isolated ONNX worker pool
-        self.onnx_executor = self._create_isolated_worker_pool()
+        # Create worker configs
+        self.worker_configs = self._create_worker_configs()
         
-        # Thread-local storage for non-PDF parsers (runs in main process)
+        # Create simple process pool WITHOUT initializer
+        self.onnx_executor = ProcessPoolExecutor(
+            max_workers=self.onnx_workers
+            # No initializer, no initargs - let each process initialize itself
+        )
+        
+        # Rest of initialization...
         self._local = threading.local()
-        
-        # Shared services (main process)
         self.chunker = DocumentChunker(max_chunk_size=1800, overlap=200)
-        
-        # Thread-safe deduplication
         self.seen_hashes: set[str] = set()
         self._seen_hashes_lock = threading.Lock()
         
-        # Only error logging
         logging.basicConfig(level=logging.ERROR)
 
         if milvus_config is None:
@@ -218,7 +335,24 @@ class ProcessIsolatedONNXProcessor:
             region_name="eu-west-1",
         )
         
-        print(f"🚀 Process-isolated processor: {max_concurrent_documents} workers, {onnx_workers} ONNX processes, {batch_size} batch size")
+        print(f"🚀 Process-isolated processor: {max_concurrent_documents} coordinators, {onnx_workers} ONNX processes, {batch_size} batch size")
+
+    def _create_worker_configs(self):
+        """Create worker configurations with CPU core assignments."""
+        cores_per_worker = 48 // self.onnx_workers
+        
+        worker_configs = []
+        for i in range(self.onnx_workers):
+            start_core = 16 + (i * cores_per_worker)
+            end_core = start_core + cores_per_worker - 1
+            cpu_cores = list(range(start_core, min(end_core + 1, 64)))
+            worker_configs.append((i, cpu_cores))
+        
+        print(f"🏗️  Configured {self.onnx_workers} ONNX worker processes:")
+        for worker_id, cores in worker_configs:
+            print(f"   Worker {worker_id}: CPU cores {cores[0]}-{cores[-1]}")
+        
+        return worker_configs
 
     def _create_isolated_worker_pool(self):
         """Create pool with fewer workers to avoid memory issues."""
@@ -285,9 +419,8 @@ class ProcessIsolatedONNXProcessor:
         except:
             return b""
 
-
     def process_single_document(self, document_info: Tuple[dict, Dict[str, Any]]) -> List[Document]:
-        """Process with error recovery and pool recreation."""
+        """Process single document with fixed worker assignment."""
         file_info, base_metadata = document_info
         
         s3_uri = file_info.get("s3_uri")
@@ -308,37 +441,18 @@ class ProcessIsolatedONNXProcessor:
             if is_pdf:
                 self.tracker.start_doc(original_url)
                 
-                # ✅ Add retry logic for crashed process pool
-                max_retries = 2
-                for attempt in range(max_retries):
-                    try:
-                        future = self.onnx_executor.submit(
-                            process_pdf_in_isolated_worker, 
-                            (content, original_url, base_metadata)
-                        )
-                        
-                        # Add timeout to prevent hanging
-                        serialized_docs = future.result(timeout=120)  # 2 minute timeout
-                        break
-                        
-                    except Exception as e:
-                        if "process pool is not usable" in str(e) or "child process terminated" in str(e):
-                            print(f"🔄 Worker pool crashed, recreating... (attempt {attempt + 1}/{max_retries})")
-                            
-                            # Recreate the process pool
-                            try:
-                                self.onnx_executor.shutdown(wait=False)
-                            except:
-                                pass
-                            
-                            self.onnx_executor = self._create_isolated_worker_pool()
-                            
-                            if attempt == max_retries - 1:
-                                print(f"❌ Failed to process {original_url} after {max_retries} attempts")
-                                return []
-                        else:
-                            raise e
-                else:
+                # Submit to process pool with worker configs
+                try:
+                    future = self.onnx_executor.submit(
+                        process_pdf_with_dynamic_worker_init,
+                        (content, original_url, base_metadata, self.worker_configs)
+                    )
+                    
+                    # Get result with timeout
+                    serialized_docs = future.result(timeout=180)  # 3 minute timeout
+                    
+                except Exception as e:
+                    print(f"❌ ONNX processing failed for {original_url}: {e}")
                     return []
                 
                 # Convert back to Document objects
@@ -357,7 +471,7 @@ class ProcessIsolatedONNXProcessor:
                 return processed_docs
                 
             else:
-                # Use regular processor for non-PDFs
+                # Non-PDF processing
                 self.tracker.start_doc(original_url)
                 processor = self._get_non_pdf_processor()
                 elements = processor.process(content, original_url, content_type)
@@ -378,6 +492,14 @@ class ProcessIsolatedONNXProcessor:
             return []
         finally:
             self.tracker.finish_doc(original_url, len(processed_docs) if 'processed_docs' in locals() else 0)
+
+    def cleanup(self):
+        """Cleanup process pool."""
+        if hasattr(self, 'onnx_executor'):
+            self.onnx_executor.shutdown(wait=True)
+            print("🧹 Cleaned up ONNX worker processes")
+
+
     @staticmethod
     def _extract_page_number(doc: Document) -> int:
         # If the chunker preserved page_number, use it; else 0
