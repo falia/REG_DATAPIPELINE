@@ -279,7 +279,11 @@ class S3MetadataProcessor:
                     try:
                         docs = future.result()
                         all_docs.extend(docs)
+                        
+
+                    except Exception as e:
                         self.logger.error(f"Failed to process PDF {file_info.get('url', 'unknown')}: {e}")
+                        return []
 
         return all_docs
 
