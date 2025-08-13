@@ -5,73 +5,70 @@ import logging
 import time
 import os
 import tempfile
-from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
-from langchain_core.documents import Document
-from concurrent.futures import ProcessPoolExecutor, as_completed
+
+from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 import multiprocessing as mp
 
-# ==========================
-# DISABLE NOISE LOGGING
-# ==========================
+from langchain_core.documents import Document
+
+# ========== QUIET NOISE ==========
 logging.getLogger('boto3').setLevel(logging.CRITICAL)
 logging.getLogger('botocore').setLevel(logging.CRITICAL)
-logging.getLogger('unstructured').setLevel(logging.CRITICAL)
-logging.getLogger('unstructured_inference').setLevel(logging.CRITICAL)
-logging.getLogger('embeddings').setLevel(logging.CRITICAL)
+logging.getLogger('unstructured').setLevel(logging.ERROR)
+logging.getLogger('unstructured_inference').setLevel(logging.ERROR)
+logging.getLogger('embeddings').setLevel(logging.ERROR)
+logging.getLogger('pdfminer').setLevel(logging.ERROR)
+logging.getLogger('PIL').setLevel(logging.ERROR)
 
-# ==========================
-# LOCAL IMPORTS (MAIN PROC)
-# ==========================
+# ========== YOUR MODULES ==========
 from embeddings.embedding_provider.embedding_provider import EmbeddingService
 from embeddings.chunker.document_chunker import DocumentChunker
 from embeddings.parsers.parser import EurlexHTMLParser, CSSFHTMLParser, DocumentProcessor
 
-# ==========================================================
-# Worker process initialization: isolate ORT threads per proc
-# ==========================================================
 
+# ==========================================================
+# Worker process init: cap intra-op threads, keep things lean
+# ==========================================================
 def _worker_init(omp_threads: int = 1):
     os.environ.setdefault("OMP_NUM_THREADS", str(omp_threads))
     os.environ.setdefault("MKL_NUM_THREADS", str(omp_threads))
     os.environ.setdefault("OPENBLAS_NUM_THREADS", str(omp_threads))
     os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
-    # For onnxruntime parallel kernels, avoid oversubscription
     os.environ.setdefault("ORT_DISABLE_MEMORY_ARENA", "0")
 
-# Per-process singletons (created lazily inside the worker)
+
+# ==============================
+# Per-worker singletons & caches
+# ==============================
 _PDF_CHUNKER = None
 _HTML_PROCESSOR = None
+_S3_CLIENT = None
 
 
 def _ensure_worker_tools(chunker_cfg: Optional[Dict[str, Any]] = None):
     """Instantiate per-process tools exactly once."""
     global _PDF_CHUNKER, _HTML_PROCESSOR
     if _PDF_CHUNKER is None:
-        # Keep the same chunking parameters as before
-        max_chunk = 1800
-        overlap = 200
-        if chunker_cfg:
-            max_chunk = int(chunker_cfg.get("max_chunk_size", max_chunk))
-            overlap = int(chunker_cfg.get("overlap", overlap))
+        max_chunk = int((chunker_cfg or {}).get("max_chunk_size", 1800))
+        overlap = int((chunker_cfg or {}).get("overlap", 200))
         _PDF_CHUNKER = DocumentChunker(max_chunk_size=max_chunk, overlap=overlap)
     if _HTML_PROCESSOR is None:
         _HTML_PROCESSOR = DocumentProcessor(parsers=[EurlexHTMLParser(), CSSFHTMLParser()])
 
 
-# ==============================
-# Helpers reused across processes
-# ==============================
+def _s3_read_bytes(bucket: str, s3_uri: str) -> bytes:
+    global _S3_CLIENT
+    if _S3_CLIENT is None:
+        _S3_CLIENT = boto3.client("s3")
+    key = s3_uri.replace(f"s3://{bucket}/", "")
+    resp = _S3_CLIENT.get_object(Bucket=bucket, Key=key)
+    return resp["Body"].read()
+
 
 def _is_pdf(url: str, content_type: str) -> bool:
     return (url.lower().endswith(".pdf") or (content_type and "application/pdf" in content_type.lower()))
-
-
-def _s3_read_bytes(bucket: str, s3_uri: str) -> bytes:
-    s3 = boto3.client("s3")
-    key = s3_uri.replace(f"s3://{bucket}/", "")
-    resp = s3.get_object(Bucket=bucket, Key=key)
-    return resp["Body"].read()
 
 
 def _extract_page_number_from_doc(doc: Document) -> int:
@@ -82,20 +79,19 @@ def _extract_page_number_from_doc(doc: Document) -> int:
 
 
 # ======================================
-# The actual worker: parse + chunk per doc
+# Worker: parse + chunk a single document
 # ======================================
-
 def parse_and_chunk_worker(
     bucket: str,
     file_info: Dict[str, Any],
     base_metadata: Dict[str, Any],
-    model_name: str = "detectron2_onnx",  # or "yolox" / "yolox_quantized"
+    model_name: str = "detectron2_onnx",  # try "yolox_quantized" for more speed on CPU
     omp_threads: int = 1,
     chunker_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Runs inside a separate process. Each process owns its ONNX Runtime session(s)
-    and threadpools. Returns a payload serializable across processes.
+    and threadpools. Returns serializable payload: {ok, url, n_chunks, docs:[{text, page_number}]}
     """
     try:
         _ensure_worker_tools(chunker_cfg)
@@ -112,17 +108,16 @@ def parse_and_chunk_worker(
 
         elements = None
         if _is_pdf(original_url, content_type):
-            # Prefer Unstructured's hi_res + ONNX backend
+            # Prefer Unstructured hi_res with ONNX backend
             from unstructured.partition.pdf import partition_pdf
 
-            # Optional header/footer redaction if available
             redacted_path = None
             with tempfile.NamedTemporaryFile(mode="wb", suffix=".pdf", delete=False) as tmp:
                 tmp.write(content)
                 pdf_path = tmp.name
             try:
+                # Optional header/footer redaction if available
                 try:
-                    # If your custom redactor exists, use it; otherwise skip.
                     from embeddings.parsers.PDFRemoveHeaderFooter import HeaderFooterRedactor
                     redactor = HeaderFooterRedactor(
                         top_k=5, bottom_k=3, win=8,
@@ -133,40 +128,29 @@ def parse_and_chunk_worker(
                 except Exception:
                     redacted_path = pdf_path
 
-                # ONNX-backed hi_res model selection
                 elements = partition_pdf(
                     filename=redacted_path,
                     strategy="hi_res",
                     hi_res_model_name=model_name,
                     extract_images_in_pdf=False,
+                    languages=["en", "fr"],     # set expected languages to skip detection
                 )
             finally:
-                # Cleanup
-                for p in (pdf_path, redacted_path):
-                    if p and os.path.exists(p) and p != redacted_path:
-                        try:
-                            os.unlink(p)
-                        except Exception:
-                            pass
+                # Cleanup the original tmp file; keep redacted_path if same as pdf_path
+                if pdf_path and os.path.exists(pdf_path) and pdf_path != redacted_path:
+                    try:
+                        os.unlink(pdf_path)
+                    except Exception:
+                        pass
         else:
-            # HTML and others
+            # HTML and other content types
             elements = _HTML_PROCESSOR.process(content, original_url, content_type)
 
-        # Chunk into LangChain Documents
+        # Chunk into lightweight dicts
         chunked_docs: List[Document] = _PDF_CHUNKER.chunk_document(elements, original_url)
-        packed_docs = []
-        for d in chunked_docs:
-            packed_docs.append({
-                "text": d.page_content,
-                "page_number": _extract_page_number_from_doc(d)
-            })
+        packed_docs = [{"text": d.page_content, "page_number": _extract_page_number_from_doc(d)} for d in chunked_docs]
 
-        return {
-            "ok": True,
-            "url": original_url,
-            "docs": packed_docs,
-            "n_chunks": len(packed_docs),
-        }
+        return {"ok": True, "url": original_url, "docs": packed_docs, "n_chunks": len(packed_docs)}
     except Exception as e:
         return {"ok": False, "url": file_info.get("url", "unknown"), "error": str(e)}
 
@@ -208,20 +192,17 @@ class ProcessIsolatedONNXPipeline:
         session_id: Optional[str] = None,
         milvus_config: Optional[Dict[str, Any]] = None,
         max_workers: int = 8,
-        batch_size: int = 30,
         omp_threads: int = 1,
         hi_res_model_name: str = "detectron2_onnx",
     ):
         self.s3_bucket = s3_bucket
         self.session_id = session_id
         self.max_workers = max_workers
-        self.batch_size = batch_size
         self.omp_threads = omp_threads
         self.hi_res_model_name = hi_res_model_name
 
         self.s3 = boto3.client("s3")
         self.tracker = ParallelismTracker()
-        self.chunker = DocumentChunker(max_chunk_size=1800, overlap=200)  # used only for safety; chunking is in workers
 
         self._seen_hashes: set[str] = set()
         self._seen_hashes_lock = mp.RLock()
@@ -243,13 +224,21 @@ class ProcessIsolatedONNXPipeline:
             region_name="eu-west-1",
         )
 
-        print(
-            f"🚀 Process-isolated pipeline: {max_workers} worker processes, model={hi_res_model_name}, OMP={omp_threads}, batch={batch_size}"
+        # Persistent warm pool (continuous scheduling)
+        self._ctx = mp.get_context("spawn")
+        self._executor = ProcessPoolExecutor(
+            max_workers=self.max_workers,
+            mp_context=self._ctx,
+            initializer=_worker_init,
+            initargs=(self.omp_threads,),
+            # max_tasks_per_child=50,  # optional (Python 3.11+)
         )
 
-    # -----------------
-    # S3 helpers (main)
-    # -----------------
+        print(f"🚀 Continuous pipeline: {max_workers} worker processes, model={hi_res_model_name}, OMP={omp_threads}")
+
+    # ------------
+    # S3 utilities
+    # ------------
     def get_session_metadata_files(self, session_id: str) -> List[str]:
         try:
             paginator = self.s3.get_paginator("list_objects_v2")
@@ -271,9 +260,9 @@ class ProcessIsolatedONNXPipeline:
         except Exception:
             return {}
 
-    # ----------------------
-    # Metadata flatten (main)
-    # ----------------------
+    # ---------------
+    # Metadata helper
+    # ---------------
     def flatten_metadata_for_search(self, metadata: dict, page_number: Optional[int] = None) -> dict:
         def _clamp(x: Any, n: int) -> Any:
             if isinstance(x, str):
@@ -314,13 +303,10 @@ class ProcessIsolatedONNXPipeline:
         return md
 
     # -----------------------
-    # Storage in Milvus (main)
+    # Store in Milvus (schema)
     # -----------------------
     def store_documents_in_milvus(self, documents: List[Document]) -> Dict[str, Any]:
-        """Store documents in Milvus using FULL flattened metadata.
-        Ensures required schema fields (e.g., `subtitle`) are always present
-        and types are normalized to match the collection schema.
-        """
+        """Store with FULL flattened metadata & normalization (fixes 'subtitle' required errors)."""
         if not documents:
             return {"count": 0, "milvus_ids": []}
 
@@ -336,17 +322,14 @@ class ProcessIsolatedONNXPipeline:
 
         def _normalize_meta(md: Dict[str, Any]) -> Dict[str, Any]:
             m = dict(md or {})
-            # Ensure all required fields exist
             for f in REQUIRED_FIELDS:
                 if f not in m or m[f] is None:
                     m[f] = 0 if f in INT_FIELDS else ""
-            # Coerce ints
             for f in INT_FIELDS:
                 try:
                     m[f] = int(m.get(f, 0) or 0)
                 except Exception:
                     m[f] = 0
-            # Ensure JSON-encoded strings for array-ish fields
             for f in JSON_STRING_FIELDS:
                 v = m.get(f, [])
                 if not isinstance(v, str):
@@ -358,11 +341,9 @@ class ProcessIsolatedONNXPipeline:
 
         new_docs, texts, metas = [], [], []
         for d in documents:
-            # Start from the document's flattened metadata
             base_meta = _normalize_meta(d.metadata)
             base_meta["doc_id"] = hashlib.sha256((d.page_content + base_meta.get("url", "")).encode()).hexdigest()
 
-            # Thread-safe de-dup on doc_id
             with self._seen_hashes_lock:
                 if base_meta["doc_id"] in self._seen_hashes:
                     continue
@@ -383,164 +364,117 @@ class ProcessIsolatedONNXPipeline:
             print(f"❌ Failed to store in Milvus: {e}")
             return {"count": 0, "milvus_ids": []}
 
-        new_docs, texts, metas = [], [], []
-        for d in documents:
-            meta = {
-                "url": d.metadata.get("url", ""),
-                "title": d.metadata.get("title", ""),
-                "page_number": d.metadata.get("page_number", 0),
-                "crawl_session": d.metadata.get("crawl_session", ""),
-                "doc_id": hashlib.sha256((d.page_content + d.metadata.get("url", "")).encode()).hexdigest(),
-            }
-            with self._seen_hashes_lock:
-                if meta["doc_id"] in self._seen_hashes:
-                    continue
-                self._seen_hashes.add(meta["doc_id"])
-
-            new_docs.append(d)
-            texts.append(d.page_content)
-            metas.append(meta)
-
-        if not new_docs:
-            return {"count": 0, "milvus_ids": []}
-
-        try:
-            result = self.embedding_service.add_texts_to_store(texts=texts, metadatas=metas)
-            print(f"💾 Stored {result['count']} documents in Milvus")
-            return result
-        except Exception as e:
-            print(f"❌ Failed to store in Milvus: {e}")
-            return {"count": 0, "milvus_ids": []}
-
-    # -----------------
-    # Batch processing
-    # -----------------
-    def process_batch(self, batch: List[Tuple[dict, Dict[str, Any]]], batch_num: int) -> List[Document]:
-        print(f"\n🎯 BATCH {batch_num}: Processing {len(batch)} documents")
-        print(f"   🧪 Workers: {self.max_workers}, Model: {self.hi_res_model_name}, OMP: {self.omp_threads}")
-
-        all_docs: List[Document] = []
-        ctx = mp.get_context("spawn")
-        with ProcessPoolExecutor(
-            max_workers=self.max_workers,
-            mp_context=ctx,
-            initializer=_worker_init,
-            initargs=(self.omp_threads,),
-        ) as executor:
-            futures = []
-            for file_info, base_md in batch:
-                self.tracker.start(file_info.get("url", "unknown"))
-                futures.append(
-                    executor.submit(
-                        parse_and_chunk_worker,
-                        self.s3_bucket,
-                        file_info,
-                        base_md,
-                        self.hi_res_model_name,
-                        self.omp_threads,
-                        {"max_chunk_size": 1800, "overlap": 200},
-                    )
-                )
-
-            for fut in as_completed(futures):
-                res = fut.result()
-                url = res.get("url", "unknown")
-                if not res.get("ok"):
-                    self.tracker.finish(url, 0)
-                    print(f"❌ Failed: {url} -> {res.get('error')}")
-                    continue
-
-                # Rebuild LangChain Documents in the main process
-                base_md = None
-                for fi, md in batch:
-                    if fi.get("url") == url:
-                        base_md = md
-                        break
-                if base_md is None:
-                    base_md = {}
-
-                for d in res.get("docs", []):
-                    pn = d.get("page_number", 0)
-                    md_flat = self.flatten_metadata_for_search(base_md, page_number=pn)
-                    doc = Document(page_content=d["text"], metadata=md_flat)
-                    all_docs.append(doc)
-
-                self.tracker.finish(url, len(res.get("docs", [])))
-
-        print(f"✅ BATCH {batch_num} COMPLETE: {len(all_docs)} chunks generated")
-        return all_docs
-
-    # -----------------
-    # Streaming session
-    # -----------------
-    def stream_process_session(self, session_id: str) -> Dict[str, Any]:
-        print(f"\n🌊 STREAMING WITH PROCESS-ISOLATED ONNX")
-        print(f"Session: {session_id}")
-        print(f"Workers: {self.max_workers} | Model: {self.hi_res_model_name} | OMP: {self.omp_threads}")
-        print(f"Batch size: {self.batch_size}")
-        print(f"{'='*60}")
-
+    # ---------------
+    # File enumeration
+    # ---------------
+    def _iter_session_files(self, session_id: str):
+        """Yield (file_info, base_metadata) pairs for the whole session."""
         metadata_files = self.get_session_metadata_files(session_id)
         print(f"📂 Found {len(metadata_files)} metadata files")
-
-        current_batch: List[Tuple[dict, Dict[str, Any]]] = []
-        batch_num = 1
-        total_chunks_stored = 0
-        start_time = time.time()
-
-        print(f"\n📋 Starting to collect and process...")
-        for i, metadata_file in enumerate(metadata_files):
+        for i, s3_key in enumerate(metadata_files):
             if i % 100 == 0 and i > 0:
-                print(f"   📄 Processed {i}/{len(metadata_files)} metadata files...")
+                print(f"   📄 Scanned {i}/{len(metadata_files)} metadata files...")
             try:
-                md = self.read_metadata_from_s3(metadata_file)
+                md = self.read_metadata_from_s3(s3_key)
                 if not md:
                     continue
                 md["crawl_session"] = session_id
-
                 for file_info in md.get("top_related", []):
-                    current_batch.append((file_info, md))
-                    if len(current_batch) >= self.batch_size:
-                        print(f"\n🔄 Batch {batch_num} ready ({len(current_batch)} documents)")
-                        batch_docs = self.process_batch(current_batch, batch_num)
-                        store_result = self.store_documents_in_milvus(batch_docs)
-                        total_chunks_stored += store_result.get("count", 0)
-
-                        elapsed = time.time() - start_time
-                        rate = self.tracker.total_processed / elapsed if elapsed > 0 else 0
-                        print(f"📊 BATCH {batch_num} STATS:")
-                        print(f"   Processed: {self.tracker.total_processed} docs total")
-                        print(f"   Rate: {rate:.1f} docs/sec ({rate*60:.1f} docs/min)")
-                        print(f"   Max concurrent: {self.tracker.max_concurrent}")
-
-                        current_batch = []
-                        batch_num += 1
+                    yield (file_info, md)
             except Exception as e:
-                print(f"❌ Error with metadata file {metadata_file}: {e}")
+                print(f"❌ Error with metadata file {s3_key}: {e}")
 
-        # Final batch
-        if current_batch:
-            print(f"\n🔄 Final batch {batch_num} ({len(current_batch)} documents)")
-            batch_docs = self.process_batch(current_batch, batch_num)
-            store_result = self.store_documents_in_milvus(batch_docs)
-            total_chunks_stored += store_result.get("count", 0)
+    # --------------------------
+    # Continuous streaming runner
+    # --------------------------
+    def stream_process_session(self, session_id: str) -> Dict[str, Any]:
+        print(f"\n🌊 CONTINUOUS MODE (no batches)")
+        print(f"Session: {session_id}")
+        print(f"Workers: {self.max_workers} | Model: {self.hi_res_model_name} | OMP: {self.omp_threads}")
+        print(f"{'='*60}")
+
+        start_time = time.time()
+        total_chunks_stored = 0
+
+        task_iter = self._iter_session_files(session_id)
+        inflight: dict = {}  # fut -> (file_info, base_md)
+
+        # Prime the pool
+        for _ in range(self.max_workers):
+            try:
+                file_info, base_md = next(task_iter)
+            except StopIteration:
+                break
+            url = file_info.get("url", "unknown")
+            self.tracker.start(url)
+            fut = self._executor.submit(
+                parse_and_chunk_worker,
+                self.s3_bucket, file_info, base_md,
+                self.hi_res_model_name, self.omp_threads,
+                {"max_chunk_size": 1800, "overlap": 200},
+            )
+            inflight[fut] = (file_info, base_md)
+
+        # Drain/Refill loop: when one finishes, submit the next file immediately
+        while inflight:
+            done, _ = wait(set(inflight.keys()), return_when=FIRST_COMPLETED)
+            for fut in done:
+                file_info, base_md = inflight.pop(fut)
+                url = file_info.get("url", "unknown")
+
+                try:
+                    res = fut.result()
+                    if not res.get("ok"):
+                        self.tracker.finish(url, 0)
+                        print(f"❌ Failed: {url} -> {res.get('error')}")
+                    else:
+                        docs: List[Document] = []
+                        for d in res.get("docs", []):
+                            pn = d.get("page_number", 0)
+                            md_flat = self.flatten_metadata_for_search(base_md, page_number=pn)
+                            docs.append(Document(page_content=d["text"], metadata=md_flat))
+                        self.tracker.finish(url, len(docs))
+                        if docs:
+                            store_result = self.store_documents_in_milvus(docs)
+                            total_chunks_stored += store_result.get("count", 0)
+                except Exception as e:
+                    self.tracker.finish(url, 0)
+                    print(f"❌ Error processing {url}: {e}")
+
+                # Refill one slot
+                try:
+                    file_info, base_md = next(task_iter)
+                    url2 = file_info.get("url", "unknown")
+                    self.tracker.start(url2)
+                    fut2 = self._executor.submit(
+                        parse_and_chunk_worker,
+                        self.s3_bucket, file_info, base_md,
+                        self.hi_res_model_name, self.omp_threads,
+                        {"max_chunk_size": 1800, "overlap": 200},
+                    )
+                    inflight[fut2] = (file_info, base_md)
+                except StopIteration:
+                    pass
+
+        # Wrap up
+        self._executor.shutdown(wait=True)
 
         total_time = time.time() - start_time
         final_stats = self.tracker.get_stats()
+        dpm = (final_stats["total_processed"] / total_time) * 60 if total_time > 0 else 0.0
 
         print(f"\n{'='*60}")
-        print(f"   PROCESS-ISOLATED PIPELINE COMPLETE!")
+        print(f"   CONTINUOUS PIPELINE COMPLETE!")
         print(f"   Worker processes: {self.max_workers}")
         print(f"   Total documents: {final_stats['total_processed']}")
         print(f"   Max concurrent: {final_stats['max_concurrent']}")
-        dpm = (final_stats['total_processed']/total_time)*60 if total_time > 0 else 0.0
         print(f"   Final rate: {dpm:.1f} docs/min")
         print(f"{'='*60}")
 
         return {
-            "total_processed": final_stats['total_processed'],
+            "total_processed": final_stats["total_processed"],
             "total_stored": total_chunks_stored,
-            "max_concurrent": final_stats['max_concurrent'],
+            "max_concurrent": final_stats["max_concurrent"],
             "docs_per_minute": dpm,
         }
 
@@ -548,7 +482,6 @@ class ProcessIsolatedONNXPipeline:
 # =====
 # main
 # =====
-
 def main():
     S3_BUCKET = "cssf-crawl"
     MILVUS_CONFIG = {
@@ -558,14 +491,12 @@ def main():
         "connection_args": {"host": "54.217.166.223", "port": "19530"},
     }
 
-    # Sane defaults: small OMP threads to avoid oversubscription.
     pipeline = ProcessIsolatedONNXPipeline(
         s3_bucket=S3_BUCKET,
         milvus_config=MILVUS_CONFIG,
-        max_workers=8,            # number of ONNX-isolated processes
-        batch_size=30,
-        omp_threads=1,            # per-process intra-op threads
-        hi_res_model_name="detectron2_onnx",  # or "yolox_quantized"
+        max_workers=8,             # number of ONNX-isolated processes
+        omp_threads=1,             # per-process intra-op threads
+        hi_res_model_name="detectron2_onnx",  # or "yolox_quantized" for more speed
     )
 
     result = pipeline.stream_process_session("20250702_020822")

@@ -1,246 +1,182 @@
+import os
+import io
+import re
+import sys
 import json
+import time
 import boto3
 import hashlib
 import logging
 import threading
-import time
-import queue
-import os
-from datetime import datetime
-from typing import List, Dict, Any, Optional, Tuple
-from langchain_core.documents import Document
+import shutil
+import errno
+import mimetypes
+from typing import List, Dict, Any, Optional, Iterable, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+from urllib.parse import urlparse
+from collections import defaultdict
+from queue import Queue
 
-# DISABLE ALL NOISE LOGGING
-logging.getLogger('boto3').setLevel(logging.CRITICAL)
-logging.getLogger('botocore').setLevel(logging.CRITICAL)
-logging.getLogger('unstructured').setLevel(logging.CRITICAL)
-logging.getLogger('unstructured_inference').setLevel(logging.CRITICAL)
-logging.getLogger('embeddings').setLevel(logging.CRITICAL)
+from boto3.s3.transfer import TransferConfig
 
+from langchain_core.documents import Document
 from embeddings.embedding_provider.embedding_provider import EmbeddingService
 from embeddings.chunker.document_chunker import DocumentChunker
-from embeddings.parsers.parser import EurlexHTMLParser, CSSFHTMLParser, DocumentProcessor
+from embeddings.parsers.parser import EurlexHTMLParser, CSSFHTMLParser, PDFParserPipeline, DocumentProcessor
 
+# ✅ external tracker
+from embeddings.tracker import Progress
 
-class ONNXSessionPool:
-    """Pool of isolated ONNX sessions to avoid resource contention."""
-    
-    def __init__(self, pool_size: int = 8):
-        self.pool_size = pool_size
-        self.sessions = queue.Queue(maxsize=pool_size)
-        self.lock = threading.Lock()
-        self._initialized = False
-        
-        print(f"🏊 Creating ONNX session pool with {pool_size} sessions...")
-        
-    def _create_session(self, session_id: int):
-        """Create a single ONNX session with isolated environment."""
-        print(f"   🔧 Creating ONNX session {session_id}...")
-        
-        # Set isolated environment for this session
-        session_env = {
-            'OMP_NUM_THREADS': '2',           # Limit threads per session
-            'MKL_NUM_THREADS': '2',
-            'OPENBLAS_NUM_THREADS': '2',
-            'ONNXRUNTIME_SESSION_ID': str(session_id)  # For debugging
-        }
-        
-        # Import here to avoid early initialization
-        from embeddings.parsers.ONNXPDFParser import ONNXPDFParser
-        from embeddings.parsers.PDFRemoveHeaderFooter import HeaderFooterRedactor
-        
-        class IsolatedPDFSession:
-            def __init__(self, session_id: int):
-                self.session_id = session_id
-                self.env = session_env.copy()
-                
-                # Apply environment for this session
-                self.original_env = {}
-                for key, value in self.env.items():
-                    self.original_env[key] = os.environ.get(key)
-                    os.environ[key] = value
-                
-                try:
-                    self.redactor = HeaderFooterRedactor(
-                        top_k=5, bottom_k=3, win=8,
-                        header_th=0.65, footer_th=0.65, rank_th=0.55,
-                        pad=2.0, black=True,
-                    )
-                    self.pdf_parser = ONNXPDFParser()
-                    print(f"   ✅ ONNX session {session_id} ready")
-                finally:
-                    # Restore environment (session keeps its own copy)
-                    for key, value in self.original_env.items():
-                        if value is not None:
-                            os.environ[key] = value
-                        elif key in os.environ:
-                            del os.environ[key]
-            
-            def process_pdf(self, content: bytes, url: str, content_type: str):
-                """Process PDF with this isolated session."""
-                import tempfile
-                
-                # Apply session environment
-                original_env = {}
-                for key, value in self.env.items():
-                    original_env[key] = os.environ.get(key)
-                    os.environ[key] = value
-                
-                try:
-                    with tempfile.NamedTemporaryFile(mode="wb", suffix=".pdf", delete=False) as tmp:
-                        tmp.write(content)
-                        orig_path = tmp.name
+# Allowed fields
+ALLOWED_FIELDS = {
+    "text", "vector", "doc_id",
+    "url", "title", "subtitle", "document_type", "document_number",
+    "publication_date", "update_date", "content_hash", "crawl_timestamp",
+    "file_size", "lang", "super_category", "crawl_session",
+    "page_number", "top_related", "bottom_related", "themes", "entities", "keywords",
+}
 
-                    sanitized_path = None
-                    try:
-                        sanitized_path = self.redactor.redact_to_temp(orig_path)
-                        return self.pdf_parser.parse_file(sanitized_path)
-                    finally:
-                        for p in (orig_path, sanitized_path):
-                            if p and os.path.exists(p):
-                                try:
-                                    os.unlink(p)
-                                except:
-                                    pass
-                finally:
-                    # Restore environment
-                    for key, value in original_env.items():
-                        if value is not None:
-                            os.environ[key] = value
-                        elif key in os.environ:
-                            del os.environ[key]
-        
-        return IsolatedPDFSession(session_id)
-    
-    def initialize(self):
-        """Initialize all sessions in the pool."""
-        if self._initialized:
-            return
-            
-        with self.lock:
-            if self._initialized:
-                return
-                
-            print(f"🔄 Initializing {self.pool_size} ONNX sessions...")
-            
-            # Create all sessions
-            for i in range(self.pool_size):
-                session = self._create_session(i)
-                self.sessions.put(session)
-            
-            self._initialized = True
-            print(f"✅ ONNX session pool ready with {self.pool_size} sessions")
-    
-    @contextmanager
-    def get_session(self):
-        """Get a session from the pool (context manager for automatic return)."""
-        if not self._initialized:
-            self.initialize()
-            
-        # Get session from pool (blocks if none available)
-        session = self.sessions.get()
-        session_id = session.session_id
-        
-        try:
-            yield session
-        finally:
-            # Always return session to pool
-            self.sessions.put(session)
+def _ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
 
+# ---------- Windows/path safety helpers ----------
+_INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
 
-class ParallelismTracker:
-    """Track parallelism with session info."""
-    
-    def __init__(self):
-        self.active_threads = set()
-        self.lock = threading.Lock()
-        self.start_times = {}
-        self.completion_times = {}
-        self.max_concurrent = 0
-        self.total_processed = 0
-        
-    def start_doc(self, doc_url: str, session_id: int = None):
-        thread_id = threading.current_thread().ident
-        with self.lock:
-            self.active_threads.add(thread_id)
-            self.start_times[doc_url] = time.time()
-            current_active = len(self.active_threads)
-            self.max_concurrent = max(self.max_concurrent, current_active)
-            
-            session_info = f"S{session_id}" if session_id is not None else ""
-            print(f"🟢 START  [{current_active:2d}] {doc_url[-45:]:45s} ({session_info})")
-    
-    def finish_doc(self, doc_url: str, chunk_count: int = 0):
-        thread_id = threading.current_thread().ident
-        with self.lock:
-            self.active_threads.discard(thread_id)
-            self.completion_times[doc_url] = time.time()
-            duration = time.time() - self.start_times.get(doc_url, 0)
-            current_active = len(self.active_threads)
-            self.total_processed += 1
-            
-            print(f"✅ FINISH [{current_active:2d}] {doc_url[-45:]:45s} ({duration:4.1f}s, {chunk_count} chunks) [Total: {self.total_processed}]")
+def _safe_segment(text: str, maxlen: int = 120) -> str:
+    if text is None:
+        text = ""
+    s = str(text)
+    s = _INVALID_CHARS.sub("_", s)
+    s = re.sub(r"\s+", " ", s)
+    s = s.strip(" .")
+    if not s:
+        s = "_"
+    if len(s) > maxlen:
+        h = hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
+        s = f"{s[:maxlen-13]}_{h}"
+    reserved = {"CON","PRN","AUX","NUL"} | {f"COM{i}" for i in range(1,10)} | {f"LPT{i}" for i in range(1,10)}
+    if s.upper() in reserved:
+        s = f"_{s}_"
+    return s
 
+def _safe_hash_token(data: str, length: int = 40) -> str:
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()[:length]
 
-class PooledONNXProcessor:
-    """Processor using ONNX session pool for better performance."""
-    
-    def __init__(self, s3_bucket: str, session_id: Optional[str] = None, 
-                 milvus_config: Optional[Dict] = None, max_concurrent_documents: int = 15,
-                 onnx_pool_size: int = 8, batch_size: int = 30):
+def _win_long_path(path: str) -> str:
+    if os.name == "nt":
+        if not path.startswith("\\\\?\\"):
+            abs_path = os.path.abspath(path)
+            if len(abs_path) >= 240:
+                return "\\\\?\\" + abs_path
+            return abs_path
+    return path
+
+def _safe_local_rel_from_key(s3_key: str) -> str:
+    parts = [p for p in s3_key.split("/") if p not in ("", ".", "..")]
+    if not parts:
+        return _safe_segment("file")
+    head = parts[:2]
+    tail = "/".join(parts[2:]) if len(parts) > 2 else parts[-1]
+    safe_head = [_safe_segment(p) for p in head]
+    hint = _safe_segment(head[1] if len(head) > 1 else parts[0], 40)
+    leaf = f"{hint}__{_safe_hash_token(tail, 40)}"
+    rel_path = os.path.join(*safe_head, leaf) if safe_head else leaf
+    return rel_path
+
+def _parse_s3_uri(s3_uri: str) -> Tuple[str, str]:
+    if s3_uri.startswith("s3://"):
+        u = urlparse(s3_uri)
+        return u.netloc, u.path.lstrip("/")
+    return "", s3_uri
+
+class S3MetadataProcessor:
+    def __init__(
+        self,
+        s3_bucket: str,
+        session_id: Optional[str] = None,
+        milvus_config: Optional[Dict] = None,
+        local_cache_dir: str = "./_cache/cssf_session",
+        max_workers: int = 12,
+        download_max_workers: int = 16,
+        multipart_chunksize_mb: int = 64,
+        region_name: Optional[str] = None,
+        batch_store_size: int = 256,
+        transfer_threads_per_download: int = 8,  # threads per object for multipart
+    ):
         self.s3_bucket = s3_bucket
         self.session_id = session_id
-        self.max_concurrent_documents = max_concurrent_documents
-        self.batch_size = batch_size
-        
-        self.s3 = boto3.client("s3")
-        self.tracker = ParallelismTracker()
-        
-        # ONNX Session Pool - this is the key improvement!
-        self.onnx_pool = ONNXSessionPool(pool_size=onnx_pool_size)
-        
-        # Thread-local storage for non-PDF parsers
-        self._local = threading.local()
-        
-        # Shared services
+        self.local_cache_dir = os.path.abspath(local_cache_dir)
+        self.max_workers = max_workers                       # processing workers
+        self.download_max_workers = download_max_workers     # download workers
+        self.batch_store_size = batch_store_size
+        self.transfer_threads = transfer_threads_per_download
+
+        session = boto3.session.Session(region_name=region_name)
+        self.s3 = session.client("s3")
+
+        self.transfer_config = TransferConfig(
+            multipart_threshold=multipart_chunksize_mb * 1024 * 1024,
+            multipart_chunksize=multipart_chunksize_mb * 1024 * 1024,
+            max_concurrency=self.transfer_threads,
+            use_threads=True,
+        )
+
+        # ---- Parser wiring ----
+        # Use a shared, lightweight HTML processor
+        self.html_processor = DocumentProcessor(parsers=[EurlexHTMLParser(), CSSFHTMLParser()])
+        # PDF parser is NOT shared; created per-thread (thread-local) to avoid cross-thread state.
+        self._tls = threading.local()
+        self.pdf_max_concurrency = int(os.getenv("CSSF_PDF_CONCURRENCY", "16"))
+        self._pdf_slots = threading.Semaphore(self.pdf_max_concurrency)
+
         self.chunker = DocumentChunker(max_chunk_size=1800, overlap=200)
-        
-        # Thread-safe deduplication
+
+        # dedupe structures (thread-safe)
         self.seen_hashes: set[str] = set()
-        self._seen_hashes_lock = threading.Lock()
-        
-        # Only error logging
-        logging.basicConfig(level=logging.ERROR)
+        self._seen_lock = threading.Lock()
+
+        logging.basicConfig(level=logging.CRITICAL, format="%(asctime)s %(levelname)s %(message)s")
+        self.logger = logging.getLogger(__name__)
 
         if milvus_config is None:
             milvus_config = {
-                "host": "54.217.166.223",
+                "host": "34.241.177.15",
                 "port": "19530",
-                "collection_name": "cssf_documents_final_final_CGDEMO4",
-                "connection_args": {"host": "54.217.166.223", "port": "19530"},
+                "collection_name": "cssf_documents_final",
+                "connection_args": {"host": "34.241.177.15", "port": "19530"},
             }
 
         self.embedding_service = EmbeddingService(
             use_tei=True,
             milvus_config=milvus_config,
             endpoint_name="embedding-endpoint",
-            region_name="eu-west-1",
+            region_name=region_name or "eu-west-1",
         )
-        
-        print(f"🚀 Pooled processor: {max_concurrent_documents} workers, {onnx_pool_size} ONNX sessions, {batch_size} batch size")
 
-    def _get_non_pdf_processor(self):
-        """Get thread-local processor for non-PDF documents."""
-        if not hasattr(self._local, 'processor'):
-            self._local.processor = DocumentProcessor(parsers=[
-                EurlexHTMLParser(), 
-                CSSFHTMLParser()
-            ])
-        return self._local.processor
+        # Disk space policy (env-overridable)
+        self.min_free_bytes = int(float(os.getenv("CSSF_MIN_FREE_MB", "8192")) * 1024 * 1024)     # 8 GB floor
+        self.max_cache_bytes = int(float(os.getenv("CSSF_MAX_CACHE_GB", "200")) * 1024 * 1024 * 1024)  # 200 GB
 
-    # Utility methods (same as before)
+        # progress handle (set in stream_session)
+        self._progress: Optional[Progress] = None
+
+    # ---------------- util ----------------
+
+    def list_sessions(self) -> List[str]:
+        try:
+            resp = self.s3.list_objects_v2(Bucket=self.s3_bucket, Prefix="", Delimiter="/")
+            sessions = [p["Prefix"].rstrip("/") for p in resp.get("CommonPrefixes", [])]
+            sessions.sort(reverse=True)
+            return sessions
+        except Exception:
+            return []
+
+    def get_most_recent_session(self) -> Optional[str]:
+        sessions = self.list_sessions()
+        if not sessions:
+            return None
+        return sessions[0]
+
     def get_session_metadata_files(self, session_id: str) -> List[str]:
         try:
             paginator = self.s3.get_paginator("list_objects_v2")
@@ -251,30 +187,179 @@ class PooledONNXProcessor:
                     if obj["Key"].endswith("metadata.json"):
                         out.append(obj["Key"])
             return out
-        except Exception as e:
-            print(f"❌ Error listing metadata files: {e}")
+        except Exception:
             return []
 
     def read_metadata_from_s3(self, s3_key: str) -> Dict[str, Any]:
         try:
             resp = self.s3.get_object(Bucket=self.s3_bucket, Key=s3_key)
             return json.loads(resp["Body"].read().decode("utf-8"))
-        except:
+        except Exception:
             return {}
 
-    def download_document_from_s3(self, s3_uri: str) -> bytes:
+    # ---------------- disk space helpers ----------------
+
+    def _cache_dir(self) -> str:
+        return os.path.join(self.local_cache_dir, "objects")
+
+    def _bytes_free(self, path: str) -> int:
         try:
-            s3_key = s3_uri.replace(f"s3://{self.s3_bucket}/", "")
-            resp = self.s3.get_object(Bucket=self.s3_bucket, Key=s3_key)
-            return resp["Body"].read()
-        except:
+            total, used, free = shutil.disk_usage(os.path.abspath(path))
+            return free
+        except Exception:
+            return 0
+
+    def _cache_size(self) -> int:
+        root = self._cache_dir()
+        total = 0
+        for base, _, files in os.walk(root):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(base, f))
+                except Exception:
+                    pass
+        return total
+
+    def _evict_cache(self, target_free_bytes: int) -> None:
+        root = self._cache_dir()
+        entries = []
+        for base, _, files in os.walk(root):
+            for f in files:
+                p = os.path.join(base, f)
+                try:
+                    st = os.stat(p)
+                    entries.append((st.st_mtime, st.st_size, p))
+                except Exception:
+                    pass
+        entries.sort()
+        for _, _sz, p in entries:
+            try:
+                os.remove(p)
+                try:
+                    os.removedirs(os.path.dirname(p))
+                except Exception:
+                    pass
+                if self._bytes_free(root) >= target_free_bytes:
+                    break
+            except Exception:
+                pass
+
+    def _ensure_space_for(self, expected_bytes: int) -> None:
+        root = self._cache_dir()
+        _ensure_dir(root)
+        free_now = self._bytes_free(root)
+        cache_sz = self._cache_size()
+        if cache_sz > self.max_cache_bytes:
+            self._evict_cache(self.min_free_bytes + expected_bytes)
+            return
+        need = max(self.min_free_bytes + expected_bytes - free_now, 0)
+        if need > 0:
+            self._evict_cache(self.min_free_bytes + expected_bytes)
+
+    # ---------------- file I/O helpers ----------------
+
+    def _read_local_bytes(self, local_path: str) -> bytes:
+        try:
+            with open(_win_long_path(local_path), "rb") as f:
+                return f.read()
+        except Exception:
             return b""
+
+    def _filename_from_url_or_key(self, original_url: Optional[str], key: str, local_path: Optional[str] = None) -> str:
+        if original_url:
+            try:
+                u = urlparse(original_url)
+                name = os.path.basename(u.path.rstrip("/"))
+                if name:
+                    return name
+                parts = [p for p in u.path.split("/") if p]
+                if parts:
+                    return parts[-1]
+                if u.netloc:
+                    return u.netloc
+            except Exception:
+                pass
+        base = os.path.basename(key) or (os.path.basename(local_path) if local_path else "")
+        return base or "document"
+
+    # ---------------- parsing helpers (HTML vs PDF) ----------------
+
+    def _is_pdf_type(self, content_type: str, original_url: str, local_path: str) -> bool:
+        ct = (content_type or "").lower()
+        if "pdf" in ct:
+            return True
+        p = (original_url or local_path or "").lower()
+        return p.endswith(".pdf")
+
+    def _get_thread_pdf_parser(self) -> PDFParserPipeline:
+        """Create/reuse a PDF parser per-thread to avoid cross-thread sharing."""
+        if not hasattr(self._tls, "pdf_parser"):
+            self._tls.pdf_parser = PDFParserPipeline()
+        return self._tls.pdf_parser
+
+    def _parse_to_elements(self, content: bytes, original_url: str, content_type: str, is_pdf: bool):
+        if is_pdf:
+            parser = self._get_thread_pdf_parser()
+            return parser.process(content, original_url, "application/pdf")
+        # Non-PDF: shared HTML-capable processor
+        return self.html_processor.process(content, original_url, content_type)
+
+    # ---------------- streaming pipeline helpers ----------------
+
+    def _process_one_file(self, metadata: Dict[str, Any], original_url: str, content_type: str, local_path: str) -> List[Document]:
+        """Parse one local file and return chunked Documents with flattened metadata. Prints content type."""
+        fname = self._filename_from_url_or_key(original_url, key=os.path.basename(local_path), local_path=local_path)
+        ct = (content_type or "application/octet-stream").split(";")[0].strip()
+
+        content = self._read_local_bytes(local_path)
+        if not content:
+            print(f"Processed: {fname} [{ct}]")
+            return []
+
+        is_pdf = self._is_pdf_type(ct, original_url, local_path)
+
+        # PDF parsing is throttled to avoid choking other workers
+        if is_pdf:
+            with self._pdf_slots:
+                elements = self._parse_to_elements(content, original_url, ct, is_pdf=True)
+        else:
+            elements = self._parse_to_elements(content, original_url, ct, is_pdf=False)
+
+        chunked_docs = self.chunker.chunk_document(elements, original_url)
+
+        out_docs: List[Document] = []
+        for d in chunked_docs:
+            pn = self._extract_page_number(d)
+            d.metadata = self.flatten_metadata_for_search(metadata, page_number=pn)
+            out_docs.append(d)
+
+        print(f"Processed: {fname} [{ct}]")
+        return out_docs
+
+    # ---------------- metadata shaping ----------------
+
+    @staticmethod
+    def _clamp(s: Any, n: int) -> str:
+        s = "" if s is None else str(s)
+        return s[:n]
+
+    @staticmethod
+    def _as_json(val: Any, default: Any):
+        if isinstance(val, (list, dict)):
+            return val
+        if isinstance(val, str):
+            try:
+                loaded = json.loads(val)
+                return loaded if isinstance(loaded, (list, dict)) else default
+            except Exception:
+                return default
+        return default
 
     def flatten_metadata_for_search(self, metadata: dict, page_number: int | None = None) -> dict:
         md = {
-            "url": self._clamp(metadata.get("url", ""), 2500),
-            "title": self._clamp(metadata.get("title", ""), 2500),
-            "subtitle": self._clamp(metadata.get("subtitle", ""), 2500),
+            "url": self._clamp(metadata.get("url", ""), 1000),
+            "title": self._clamp(metadata.get("title", ""), 1000),
+            "subtitle": self._clamp(metadata.get("subtitle", ""), 500),
             "document_type": self._clamp(metadata.get("document_type", ""), 100),
             "document_number": self._clamp(metadata.get("document_number", ""), 100),
             "publication_date": self._clamp(metadata.get("publication_date") or "", 50),
@@ -298,233 +383,371 @@ class PooledONNXProcessor:
                 md["page_number"] = 0
         return md
 
-    def _extract_page_number(self, doc: Document) -> int:
+    @staticmethod
+    def _filter_to_schema(meta: Dict[str, Any]) -> Dict[str, Any]:
+        return {k: v for k, v in meta.items() if k in ALLOWED_FIELDS}
+
+    @staticmethod
+    def _ensure_required_fields(meta: Dict[str, Any], text: str) -> Dict[str, Any]:
+        if not meta.get("doc_id"):
+            base = (meta.get("url", "") + str(meta.get("page_number", 0)) + text).encode("utf-8")
+            meta["doc_id"] = hashlib.sha256(base).hexdigest()
         try:
-            return int(doc.metadata.get("page_number", 0)) if doc.metadata else 0
-        except:
+            meta["page_number"] = int(meta.get("page_number", 0))
+        except Exception:
+            meta["page_number"] = 0
+        return meta
+
+    @staticmethod
+    def _extract_page_number(doc: Document) -> int:
+        try:
+            pn = doc.metadata.get("page_number", 0) if isinstance(doc.metadata, dict) else 0
+            return int(pn) if pn is not None else 0
+        except Exception:
             return 0
 
-    def process_single_document(self, document_info: Tuple[dict, Dict[str, Any]]) -> List[Document]:
-        """Process single document using ONNX session pool."""
-        file_info, base_metadata = document_info
-        
-        s3_uri = file_info.get("s3_uri")
-        original_url = file_info.get("url", "unknown")
-        content_type = file_info.get("content_type", "application/octet-stream")
-        
-        # Check if it's a PDF
-        is_pdf = (original_url.lower().endswith(".pdf") or 
-                 (content_type and "application/pdf" in content_type.lower()))
-        
-        try:
-            if not s3_uri:
-                return []
+    # ---------------- hashing & storage ----------------
 
-            content = self.download_document_from_s3(s3_uri)
-            if not content:
-                return []
+    def hash_document(self, doc: Document) -> str:
+        base = (doc.page_content + str(doc.metadata.get("url", "")) + str(doc.metadata.get("page_number", 0))).encode("utf-8")
+        return hashlib.sha256(base).hexdigest()
 
-            if is_pdf:
-                # Use ONNX session pool for PDFs
-                with self.onnx_pool.get_session() as onnx_session:
-                    self.tracker.start_doc(original_url, onnx_session.session_id)
-                    
-                    try:
-                        elements = onnx_session.process_pdf(content, original_url, content_type)
-                    finally:
-                        pass  # Session automatically returned to pool
-            else:
-                # Use regular processor for non-PDFs
-                self.tracker.start_doc(original_url)
-                processor = self._get_non_pdf_processor()
-                elements = processor.process(content, original_url, content_type)
 
-            # Chunk and apply metadata (same for both)
-            chunked_docs = self.chunker.chunk_document(elements, original_url)
+    def store_documents_in_milvus_streaming(self, docs_q: Queue) -> Dict[str, Any]:
+        """
+        Consume docs from a queue and flush to Milvus in smaller batches, with a time-based flush too.
+        This prevents the first big batch from blocking the entire pipeline.
+        """
+        total_count = 0
+        all_ids: List[Any] = []
+        batch: List[Document] = []
 
-            processed_docs = []
-            for doc in chunked_docs:
-                pn = self._extract_page_number(doc)
-                doc.metadata = self.flatten_metadata_for_search(base_metadata, page_number=pn)
-                processed_docs.append(doc)
-                
-            return processed_docs
+        # tunables (env)
+        batch_target = self.batch_store_size                           # e.g., 128–256
+        flush_sec = float(os.getenv("CSSF_EMBED_FLUSH_SEC", "2.0"))     # flush every N seconds even if batch small
+        last_flush = time.time()
 
-        except Exception as e:
-            print(f"❌ Error processing {original_url}: {e}")
-            return []
-        finally:
-            self.tracker.finish_doc(original_url, len(processed_docs) if 'processed_docs' in locals() else 0)
-
-    def process_batch(self, batch: List[Tuple[dict, Dict[str, Any]]], batch_num: int) -> List[Document]:
-        """Process batch using ONNX session pool."""
-        print(f"\n🎯 BATCH {batch_num}: Processing {len(batch)} documents")
-        print(f"   🏊 ONNX pool has {self.onnx_pool.pool_size} sessions available")
-        
-        all_docs = []
-        
-        with ThreadPoolExecutor(max_workers=self.max_concurrent_documents, thread_name_prefix=f"Batch{batch_num}") as executor:
-            # Submit all jobs in this batch
-            futures = [executor.submit(self.process_single_document, doc_info) for doc_info in batch]
-            
-            # Collect results
-            for future in as_completed(futures):
-                try:
-                    docs = future.result()
-                    all_docs.extend(docs)
-                except Exception as e:
-                    print(f"❌ Batch {batch_num} job failed: {e}")
-        
-        print(f"✅ BATCH {batch_num} COMPLETE: {len(all_docs)} chunks generated")
-        return all_docs
-
-    def store_documents_in_milvus(self, documents: List[Document]) -> Dict[str, Any]:
-        """Store documents with thread-safe deduplication."""
-        if not documents:
-            return {"count": 0, "milvus_ids": []}
-
-        new_docs, texts, metas = [], [], []
-
-        for d in documents:
-            meta = {
-                "url": d.metadata.get("url", ""),
-                "title": d.metadata.get("title", ""),
-                "page_number": d.metadata.get("page_number", 0),
-                "crawl_session": d.metadata.get("crawl_session", ""),
-                "doc_id": hashlib.sha256((d.page_content + d.metadata.get("url", "")).encode()).hexdigest()
-            }
-
-            with self._seen_hashes_lock:
-                if meta["doc_id"] in self.seen_hashes:
-                    continue
-                self.seen_hashes.add(meta["doc_id"])
-
-            new_docs.append(d)
-            texts.append(d.page_content)
-            metas.append(meta)
-
-        if not new_docs:
-            return {"count": 0, "milvus_ids": []}
-
-        try:
-            result = self.embedding_service.add_texts_to_store(texts=texts, metadatas=metas)
-            print(f"💾 Stored {result['count']} documents in Milvus")
-            return result
-        except Exception as e:
-            print(f"❌ Failed to store in Milvus: {e}")
-            return {"count": 0, "milvus_ids": []}
-
-    def stream_process_session(self, session_id: str) -> Dict[str, Any]:
-        """Stream process with ONNX session pool."""
-        print(f"\n🌊 STREAMING WITH ONNX SESSION POOL")
-        print(f"Session: {session_id}")
-        print(f"ONNX pool size: {self.onnx_pool.pool_size}")
-        print(f"Max workers: {self.max_concurrent_documents}")
-        print(f"Batch size: {self.batch_size}")
-        print(f"{'='*60}")
-        
-        # Initialize ONNX pool
-        self.onnx_pool.initialize()
-        
-        # Get metadata files
-        metadata_files = self.get_session_metadata_files(session_id)
-        print(f"📂 Found {len(metadata_files)} metadata files")
-        
-        # Streaming variables
-        current_batch = []
-        batch_num = 1
-        total_chunks_stored = 0
-        start_time = time.time()
-        
-        print(f"\n📋 Starting to collect and process...")
-        
-        for i, metadata_file in enumerate(metadata_files):
-            if i % 100 == 0 and i > 0:
-                print(f"   📄 Processed {i}/{len(metadata_files)} metadata files...")
-            
+        def _flush_now():
+            nonlocal batch, total_count, all_ids, last_flush
+            if not batch:
+                last_flush = time.time()
+                return
             try:
-                metadata = self.read_metadata_from_s3(metadata_file)
-                if not metadata:
-                    continue
-                    
-                metadata["crawl_session"] = session_id
-                
-                for file_info in metadata.get("top_related", []):
-                    current_batch.append((file_info, metadata))
-                    
-                    if len(current_batch) >= self.batch_size:
-                        print(f"\n🔄 Batch {batch_num} ready ({len(current_batch)} documents)")
-                        
-                        batch_docs = self.process_batch(current_batch, batch_num)
-                        store_result = self.store_documents_in_milvus(batch_docs)
-                        total_chunks_stored += store_result["count"]
-                        
-                        elapsed = time.time() - start_time
-                        rate = self.tracker.total_processed / elapsed if elapsed > 0 else 0
-                        
-                        print(f"📊 BATCH {batch_num} STATS:")
-                        print(f"   Processed: {self.tracker.total_processed} docs total")
-                        print(f"   Rate: {rate:.1f} docs/sec ({rate*60:.1f} docs/min)")
-                        print(f"   Max concurrent: {self.tracker.max_concurrent}")
-                        
-                        current_batch = []
-                        batch_num += 1
-                        
+                texts = [d.page_content for d in batch]
+                metas = [d.metadata for d in batch]
+                # optional: quick progress hint
+                # print(f"[EMBED] flushing {len(batch)} docs...")
+                result = self.embedding_service.add_texts_to_store(texts=texts, metadatas=metas)
+                cnt = result.get("count", len(batch))
+                ids = result.get("milvus_ids", [])
+                total_count += cnt
+                all_ids.extend(ids)
+                if self._progress:
+                    self._progress.inc_stored(cnt)
             except Exception as e:
-                print(f"❌ Error with metadata file {metadata_file}: {e}")
-        
-        # Process final batch
-        if current_batch:
-            print(f"\n🔄 Final batch {batch_num} ({len(current_batch)} documents)")
-            batch_docs = self.process_batch(current_batch, batch_num)
-            store_result = self.store_documents_in_milvus(batch_docs)
-            total_chunks_stored += store_result["count"]
-        
-        # Final results
-        total_time = time.time() - start_time
-        final_stats = self.tracker.get_stats()
-        
-        print(f"\n{'='*60}")
-        print(f"   ONNX POOL PROCESSING COMPLETE!")
-        print(f"   ONNX sessions used: {self.onnx_pool.pool_size}")
-        print(f"   Total documents: {final_stats['total_processed']}")
-        print(f"   Max concurrent: {final_stats['max_concurrent']}")
-        print(f"   Final rate: {(final_stats['total_processed']/total_time)*60:.1f} docs/min")
-        print(f"{'='*60}")
-        
+                # don't kill the pipeline on embed failure; log & drop this batch
+                print(f"[EMBED][WARN] flush failed for {len(batch)} docs: {e}", file=sys.stderr)
+            finally:
+                batch = []
+                last_flush = time.time()
+
+        while True:
+            item = docs_q.get()
+            if item is None:
+                break
+
+            docs: List[Document] = item
+            for d in docs:
+                meta = self._ensure_required_fields(self._filter_to_schema(dict(d.metadata or {})), d.page_content)
+
+                doc_hash = self.hash_document(Document(page_content=d.page_content, metadata=meta))
+                with self._seen_lock:
+                    if doc_hash in self.seen_hashes:
+                        continue
+                    self.seen_hashes.add(doc_hash)
+                meta["doc_id"] = doc_hash
+
+                batch.append(Document(page_content=d.page_content, metadata=meta))
+
+                # size-based flush
+                if len(batch) >= batch_target:
+                    _flush_now()
+
+                # time-based flush
+                elif (time.time() - last_flush) >= flush_sec:
+                    _flush_now()
+
+        # final flush
+        _flush_now()
+
+        return {"count": total_count, "milvus_ids": all_ids}
+
+
+
+
+
+    def _flush_batch(self, docs: List[Document]) -> Tuple[int, List[Any]]:
+        try:
+            texts = [d.page_content for d in docs]
+            metas = [d.metadata for d in docs]
+            result = self.embedding_service.add_texts_to_store(texts=texts, metadatas=metas)
+            cnt = result.get("count", len(docs))
+            return cnt, result.get("milvus_ids", [])
+        except Exception:
+            return (0, [])
+
+    # ---------------- STREAMING SESSION ORCHESTRATION ----------------
+
+    def stream_session(self, session_id: str) -> Dict[str, Any]:
+        """Concurrent download → process → store pipeline with proper backpressure + progress tracker."""
+        # 1) Read metadata files and build download plan
+        keys = self.get_session_metadata_files(session_id)
+        if not keys:
+            return {"session_id": session_id, "processed": 0, "stored": 0, "errors": 0}
+
+        metadatas: List[Dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=min(32, self.max_workers * 2)) as ex:
+            futures = [ex.submit(self.read_metadata_from_s3, k) for k in keys]
+            for fut in as_completed(futures):
+                md = fut.result() or {}
+                if md:
+                    md["crawl_session"] = session_id
+                    metadatas.append(md)
+
+        download_jobs: List[Tuple[str, str, str, Dict[str, Any], Dict[str, Any]]] = []
+        for md in metadatas:
+            for fi in md.get("top_related", []):
+                s3_uri = fi.get("s3_uri")
+                if not s3_uri:
+                    continue
+                b, k = _parse_s3_uri(s3_uri)
+                if not b:
+                    b = self.s3_bucket
+                local_rel = _safe_local_rel_from_key(k)
+                local_path = os.path.join(self.local_cache_dir, "objects", local_rel)
+                download_jobs.append((b, k, local_path, md, fi))
+
+        if not download_jobs:
+            return {"session_id": session_id, "processed": 0, "stored": 0, "errors": 0}
+
+        # 2) Progress + heartbeat
+        progress = Progress(total_files=len(download_jobs))
+        self._progress = progress
+
+        hb_stop = threading.Event()
+        hb_interval = float(os.getenv("CSSF_PROGRESS_EVERY", "5"))
+
+        def heartbeat():
+            if os.getenv("CSSF_PROGRESS", "1") == "0":
+                return
+            while not hb_stop.wait(hb_interval):
+                snap = progress.snapshot()
+                print(
+                    "[PROG] dl {dl}/{tot} ({pdl:.1f}%) | proc {pr}/{tot} ({ppr:.1f}%) | stored_docs {sd} | rate {r:.2f} f/s | ETA ~ {eta:.0f}s"
+                    .format(dl=snap["downloaded"], pr=snap["processed"], sd=snap["stored_docs"], tot=snap["total"],
+                            pdl=snap["pct_dl"], ppr=snap["pct_pr"], r=snap["rate_fps"], eta=snap["eta_sec"])
+                )
+
+        hb = threading.Thread(target=heartbeat, name="PROG", daemon=True)
+        hb.start()
+
+        # 3) Queues
+        proc_q: Queue = Queue(maxsize=int(os.getenv("CSSF_PIPELINE_QUEUE", "100")))  # download -> processors
+        docs_q: Queue = Queue(maxsize=int(os.getenv("CSSF_DOCS_QUEUE", "200")))      # processors -> writer
+
+        # 4) Start writer FIRST
+        writer_result = {}
+        def writer_worker():
+            writer_result["res"] = self.store_documents_in_milvus_streaming(docs_q)
+
+        writer = threading.Thread(target=writer_worker, daemon=True)
+        writer.start()
+
+        # 5) Start processor workers
+        def processor_worker():
+            while True:
+                item = proc_q.get()
+                if item is None:
+                    proc_q.task_done()
+                    break
+                md, fi, local_path = item
+                original_url = (fi.get("url") or "").strip()
+                ct = (fi.get("content_type") or "").strip()
+                if not ct or ct == "application/octet-stream":
+                    guess, _ = mimetypes.guess_type(original_url or local_path)
+                    if not guess and (original_url.lower().endswith(".pdf") or local_path.lower().endswith(".pdf")):
+                        guess = "application/pdf"
+                    ct = guess or "application/octet-stream"
+                try:
+                    # Route to PDF/non-PDF paths; PDF path is semaphore-limited.
+                    is_pdf = self._is_pdf_type(ct, original_url, local_path)
+                    if is_pdf:
+                        with self._pdf_slots:
+                            docs = self._process_one_file(md, original_url, "application/pdf", local_path)
+                    else:
+                        docs = self._process_one_file(md, original_url, ct, local_path)
+
+                    if docs:
+                        docs_q.put(docs)
+                except Exception:
+                    pass
+                finally:
+                    progress.inc_processed(1)  # ✅ file processed (even if 0 chunks)
+                    proc_q.task_done()
+
+        processors = []
+        for i in range(self.max_workers):
+            t = threading.Thread(target=processor_worker, name=f"PROC-{i+1:02d}", daemon=True)
+            t.start()
+            processors.append(t)
+
+        # 6) Downloader workers (produce into proc_q)
+        def downloader_task(job_tuple):
+            b, k, lp, md, fi = job_tuple
+            original_url = fi.get("url")
+            try:
+                self._download_one(b, k, lp, original_url)
+            except Exception:
+                pass
+            if os.path.exists(lp) and os.path.getsize(lp) > 0:
+                proc_q.put((md, fi, lp))
+                progress.inc_downloaded(1)  # ✅ ready for processing
+
+        with ThreadPoolExecutor(max_workers=self.download_max_workers, thread_name_prefix="DL") as dl_ex:
+            futures = [dl_ex.submit(downloader_task, job) for job in download_jobs]
+            for _ in as_completed(futures):
+                pass
+
+        # 7) Wait until all proc_q tasks are handled, then stop processors
+        proc_q.join()
+        for _ in range(self.max_workers):
+            proc_q.put(None)
+        for t in processors:
+            t.join()
+
+        # 8) Signal writer to finish AFTER processors are done enqueuing docs
+        docs_q.put(None)
+        writer.join()
+
+        # 9) stop heartbeat
+        hb_stop.set()
+        hb.join(timeout=1)
+
+        res = writer_result.get("res", {"count": 0, "milvus_ids": []})
         return {
-            "total_processed": final_stats['total_processed'],
-            "total_stored": total_chunks_stored,
-            "max_concurrent": final_stats['max_concurrent'],
-            "docs_per_minute": (final_stats['total_processed']/total_time)*60,
+            "session_id": session_id,
+            "processed": res.get("count", 0),
+            "stored": res.get("count", 0),
+            "errors": 0,
         }
 
+    # Backwards-compat wrappers
+    def process_latest_session(self) -> Dict[str, Any]:
+        latest = self.get_most_recent_session()
+        if not latest:
+            return {"processed": 0, "stored": 0, "errors": 0}
+        return self.stream_session(latest)
+
+    def process_session(self, session_id: str) -> Dict[str, Any]:
+        return self.stream_session(session_id)
+
+    # ---------------- download helper ----------------
+
+    def _download_one(self, bucket: str, key: str, dst_path: str, original_url: Optional[str]) -> Tuple[str, bool]:
+        """Download a single S3 object to dst_path. Returns (dst_path, did_download). Prints only when downloaded."""
+        _ensure_dir(os.path.dirname(dst_path))
+        if os.path.exists(dst_path) and os.path.getsize(dst_path) > 0:
+            return (dst_path, False)
+
+        expected = 64 * 1024 * 1024
+        try:
+            head = self.s3.head_object(Bucket=bucket, Key=key)
+            expected = int(head.get("ContentLength") or expected)
+        except Exception:
+            pass
+
+        self._ensure_space_for(expected)
+
+        try:
+            dst_for_api = _win_long_path(dst_path)
+            self.s3.download_file(
+                Bucket=bucket,
+                Key=key,
+                Filename=dst_for_api,
+                Config=self.transfer_config,
+            )
+            return (dst_path, True)
+        except OSError as oe:
+            if getattr(oe, "errno", None) == errno.ENOSPC:
+                self._evict_cache(self.min_free_bytes + expected)
+                try:
+                    dst_for_api = _win_long_path(dst_path)
+                    self.s3.download_file(
+                        Bucket=bucket,
+                        Key=key,
+                        Filename=dst_for_api,
+                        Config=self.transfer_config,
+                    )
+                    print(f"Downloaded: {self._filename_from_url_or_key(original_url, key, dst_path)}")
+                    return (dst_path, True)
+                except Exception:
+                    return (dst_path, False)
+            else:
+                return (dst_path, False)
+        except Exception:
+            return (dst_path, False)
 
 def main():
-    S3_BUCKET = "cssf-crawl"
+    S3_BUCKET = os.getenv("CSSF_S3_BUCKET", "cssf-crawl")
+    SESSION_ID = os.getenv("CSSF_SESSION_ID")
+    REGION = os.getenv("AWS_REGION", "eu-west-1")
+
+    # m7i.16xlarge tuned defaults (env-overridable)
+    DL_WORKERS = int(os.getenv("CSSF_DL_WORKERS", "192"))            # files in parallel (downloader)
+    MAX_WORKERS = int(os.getenv("CSSF_MAX_WORKERS", "48"))           # processing workers
+    CHUNK_MB = int(os.getenv("CSSF_CHUNK_MB", "64"))                 # multipart chunk size
+    TRANSFER_THREADS = int(os.getenv("CSSF_TRANSFER_THREADS", "8"))  # threads per file (multipart)
+    BATCH_STORE = int(os.getenv("CSSF_BATCH_STORE", "1024"))         # embeddings batch
+    LOCAL_CACHE = os.getenv("CSSF_LOCAL_CACHE", "./_cache/cssf_session")
+
+    # queue sizes
+    os.environ.setdefault("CSSF_PIPELINE_QUEUE", "100")
+    os.environ.setdefault("CSSF_DOCS_QUEUE", "200")
+
+    # progress heartbeat controls
+    os.environ.setdefault("CSSF_PROGRESS_EVERY", "5")  # seconds
+    os.environ.setdefault("CSSF_PROGRESS", "1")        # 1=on, 0=off
+
+    # cache policy defaults for big machine
+    os.environ.setdefault("CSSF_MIN_FREE_MB", "8192")
+    os.environ.setdefault("CSSF_MAX_CACHE_GB", "200")
+
+    # NEW: cap PDF concurrency (defaults to 4)
+    os.environ.setdefault("CSSF_PDF_CONCURRENCY", "4")
+
     MILVUS_CONFIG = {
         "host": "54.217.166.223",
-        "port": "19530", 
-        "collection_name": "cssf_documents_final_final_CGDEM102",
+        "port": "19530",
+        "collection_name": "cssf_documents_final_final_CGDEMO41",
         "connection_args": {"host": "54.217.166.223", "port": "19530"},
     }
 
-    # Create processor with ONNX session pool
-    processor = PooledONNXProcessor(
+    processor = S3MetadataProcessor(
         s3_bucket=S3_BUCKET,
+        session_id=SESSION_ID,
         milvus_config=MILVUS_CONFIG,
-        max_concurrent_documents=15,  # Can handle more workers now
-        onnx_pool_size=8,            # 8 isolated ONNX sessions
-        batch_size=30
+        local_cache_dir=LOCAL_CACHE,
+        max_workers=MAX_WORKERS,
+        download_max_workers=DL_WORKERS,
+        multipart_chunksize_mb=CHUNK_MB,
+        region_name=REGION,
+        batch_store_size=BATCH_STORE,
+        transfer_threads_per_download=TRANSFER_THREADS,
     )
 
-    # Stream process with session pool
-    result = processor.stream_process_session("20250702_020822")
-    
-    print(f"\n🎉 FINAL RESULTS:")
-    print(f"Rate: {result['docs_per_minute']:.1f} docs/minute")
-    print(f"Max concurrent: {result['max_concurrent']}")
-
+    target_session = SESSION_ID or processor.get_most_recent_session()
+    if target_session:
+        processor.stream_session(target_session)
 
 if __name__ == "__main__":
     main()
