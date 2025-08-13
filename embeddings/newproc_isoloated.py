@@ -357,6 +357,15 @@ class ProcessIsolatedONNXProcessor:
         finally:
             self.tracker.finish_doc(original_url, len(processed_docs) if 'processed_docs' in locals() else 0)
 
+    @staticmethod
+    def _extract_page_number(doc: Document) -> int:
+        # If the chunker preserved page_number, use it; else 0
+        try:
+            pn = doc.metadata.get("page_number", 0) if isinstance(doc.metadata, dict) else 0
+            return int(pn) if pn is not None else 0
+        except Exception:
+            return 0
+
     def process_batch(self, batch: List[Tuple[dict, Dict[str, Any]]], batch_num: int) -> List[Document]:
         """Process batch using isolated ONNX workers."""
         print(f"\n🎯 BATCH {batch_num}: Processing {len(batch)} documents")
@@ -550,7 +559,7 @@ def main():
     MILVUS_CONFIG = {
         "host": "54.217.166.223",
         "port": "19530", 
-        "collection_name": "CGDEMO450",
+        "collection_name": "cssf_documents_final_final_CGDEMO4",
         "connection_args": {"host": "54.217.166.223", "port": "19530"},
     }
 
