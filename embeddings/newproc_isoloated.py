@@ -357,6 +357,15 @@ class ProcessIsolatedONNXProcessor:
         finally:
             self.tracker.finish_doc(original_url, len(processed_docs) if 'processed_docs' in locals() else 0)
 
+    @staticmethod
+    def _extract_page_number(doc: Document) -> int:
+        # If the chunker preserved page_number, use it; else 0
+        try:
+            pn = doc.metadata.get("page_number", 0) if isinstance(doc.metadata, dict) else 0
+            return int(pn) if pn is not None else 0
+        except Exception:
+            return 0
+
     def process_batch(self, batch: List[Tuple[dict, Dict[str, Any]]], batch_num: int) -> List[Document]:
         """Process batch using isolated ONNX workers."""
         print(f"\n🎯 BATCH {batch_num}: Processing {len(batch)} documents")
@@ -540,6 +549,94 @@ class ProcessIsolatedONNXProcessor:
         if hasattr(self, 'onnx_executor'):
             self.onnx_executor.shutdown(wait=True)
             print("🧹 Cleaned up isolated ONNX worker processes")
+
+
+    def flatten_metadata_for_search(self, metadata: dict, page_number: int | None = None) -> dict:
+        """Flatten metadata for search with proper field handling."""
+        md = {
+            "url": self._clamp(metadata.get("url", ""), 1000),
+            "title": self._clamp(metadata.get("title", ""), 1000),
+            "subtitle": self._clamp(metadata.get("subtitle", ""), 500),
+            "document_type": self._clamp(metadata.get("document_type", ""), 100),
+            "document_number": self._clamp(metadata.get("document_number", ""), 100),
+            "publication_date": self._clamp(metadata.get("publication_date") or "", 50),
+            "update_date": self._clamp(metadata.get("update_date") or "", 50),
+            "content_hash": self._clamp(metadata.get("content_hash", ""), 100),
+            "crawl_timestamp": self._clamp(metadata.get("crawl_timestamp", ""), 50),
+            "file_size": int(metadata.get("file_size") or 0),
+            "lang": self._clamp(metadata.get("lang", ""), 10),
+            "super_category": self._clamp(metadata.get("super_category", ""), 100),
+            "crawl_session": self._clamp(metadata.get("crawl_session", ""), 50),
+            "top_related": self._as_json(metadata.get("top_related", []), []),
+            "bottom_related": self._as_json(metadata.get("bottom_related", []), []),
+            "themes": self._as_json(metadata.get("themes", []), []),
+            "entities": self._as_json(metadata.get("entities", []), []),
+            "keywords": self._as_json(metadata.get("keywords", []), []),
+        }
+        if page_number is not None:
+            try:
+                md["page_number"] = int(page_number)
+            except Exception:
+                md["page_number"] = 0
+        return md
+
+    def _clamp(self, value: str, max_length: int) -> str:
+        """Clamp string to maximum length."""
+        if not isinstance(value, str):
+            value = str(value) if value is not None else ""
+        return value[:max_length] if len(value) > max_length else value
+
+    def _as_json(self, value: Any, default: Any) -> str:
+        """Convert value to JSON string safely."""
+        try:
+            if value is None:
+                return json.dumps(default)
+            return json.dumps(value)
+        except Exception:
+            return json.dumps(default)
+
+    def _filter_to_schema(self, metadata: dict) -> dict:
+        """Filter metadata to match Milvus schema."""
+        # Define allowed fields based on your Milvus collection schema
+        allowed_fields = {
+            "url", "title", "subtitle", "document_type", "document_number",
+            "publication_date", "update_date", "content_hash", "crawl_timestamp",
+            "file_size", "lang", "super_category", "crawl_session", "page_number",
+            "top_related", "bottom_related", "themes", "entities", "keywords", "doc_id"
+        }
+        
+        return {k: v for k, v in metadata.items() if k in allowed_fields}
+
+    def _ensure_required_fields(self, metadata: dict, content: str) -> dict:
+        """Ensure all required fields are present in metadata."""
+        # Set defaults for required fields
+        metadata.setdefault("url", "")
+        metadata.setdefault("title", "")
+        metadata.setdefault("page_number", 0)
+        metadata.setdefault("crawl_session", self.session_id or "")
+        
+        # Generate doc_id if not present
+        if "doc_id" not in metadata:
+            metadata["doc_id"] = hashlib.sha256(
+                (content + metadata.get("url", "")).encode()
+            ).hexdigest()
+        
+        return metadata
+
+    def hash_document(self, doc: Document) -> str:
+        """Generate hash for document deduplication."""
+        content_hash = hashlib.sha256(doc.page_content.encode()).hexdigest()
+        url_hash = hashlib.sha256(doc.metadata.get("url", "").encode()).hexdigest()
+        return hashlib.sha256((content_hash + url_hash).encode()).hexdigest()
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get final statistics - this should be added to ParallelismTracker class."""
+        return {
+            "total_processed": self.total_processed,
+            "max_concurrent": self.max_concurrent,
+            "start_times": self.start_times,
+            "completion_times": self.completion_times
+        }
 
 
 def main():
