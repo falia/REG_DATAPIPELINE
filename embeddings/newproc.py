@@ -272,9 +272,9 @@ class PooledONNXProcessor:
 
     def flatten_metadata_for_search(self, metadata: dict, page_number: int | None = None) -> dict:
         md = {
-            "url": self._clamp(metadata.get("url", ""), 1000),
-            "title": self._clamp(metadata.get("title", ""), 1000),
-            "subtitle": self._clamp(metadata.get("subtitle", ""), 500),
+            "url": self._clamp(metadata.get("url", ""), 2500),
+            "title": self._clamp(metadata.get("title", ""), 2500),
+            "subtitle": self._clamp(metadata.get("subtitle", ""), 2500),
             "document_type": self._clamp(metadata.get("document_type", ""), 100),
             "document_number": self._clamp(metadata.get("document_number", ""), 100),
             "publication_date": self._clamp(metadata.get("publication_date") or "", 50),

@@ -2,7 +2,6 @@ import json
 import boto3
 import hashlib
 import logging
-import queue
 import threading
 import time
 import os
@@ -13,8 +12,9 @@ from typing import List, Dict, Any, Optional, Tuple
 from langchain_core.documents import Document
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
-_worker_assignment_lock = threading.Lock()
-_next_worker_id = 0
+# Global worker assignment tracking
+_worker_assignments = {}
+_assignment_lock = threading.Lock()
 
 # DISABLE ALL NOISE LOGGING
 logging.getLogger('boto3').setLevel(logging.CRITICAL)
@@ -28,81 +28,160 @@ from embeddings.chunker.document_chunker import DocumentChunker
 from embeddings.parsers.parser import EurlexHTMLParser, CSSFHTMLParser, DocumentProcessor
 
 
+# =================== MODULE-LEVEL FUNCTIONS FOR MULTIPROCESSING ===================
 
-
-
-# ISOLATED ONNX WORKER FUNCTION (runs in separate process)
 def isolated_onnx_worker_init(worker_id: int, cpu_cores: List[int]):
-    """Initialize isolated ONNX worker process with dedicated CPU cores."""
+    """Enhanced worker initialization with better resource isolation."""
     global worker_id_global, onnx_parser, redactor, chunker
     
-    # Set CPU affinity for this worker
-    p = psutil.Process()
-    p.cpu_affinity(cpu_cores)
-    
-    # Set isolated environment
-    os.environ['OMP_NUM_THREADS'] = '2'
-    os.environ['MKL_NUM_THREADS'] = '2'
-    os.environ['OPENBLAS_NUM_THREADS'] = '2'
-    os.environ['ONNX_WORKER_ID'] = str(worker_id)
-    
-    # Create worker-specific temp directory
-    worker_temp = f"/tmp/onnx_worker_{worker_id}"
-    os.makedirs(worker_temp, exist_ok=True)
-    os.environ['TMPDIR'] = worker_temp
-    
-    # Initialize ONNX components in this process
-    from embeddings.parsers.ONNXPDFParser import ONNXPDFParser
-    from embeddings.parsers.PDFRemoveHeaderFooter import HeaderFooterRedactor
-    from embeddings.chunker.document_chunker import DocumentChunker
-    
-    worker_id_global = worker_id
-    onnx_parser = ONNXPDFParser()
-    redactor = HeaderFooterRedactor(
-        top_k=5, bottom_k=3, win=8,
-        header_th=0.65, footer_th=0.65, rank_th=0.55,
-        pad=2.0, black=True,
-    )
-    chunker = DocumentChunker(max_chunk_size=1800, overlap=200)
-    
-    print(f"🔧 ONNX Worker {worker_id} initialized on cores {cpu_cores} (PID: {os.getpid()})")
-
-
-# ✅ THIS MUST BE AT MODULE LEVEL - NOT INSIDE ANY CLASS!
-def init_worker_wrapper(config):
-    """Module-level wrapper for worker initialization - MUST be at module level for pickling."""
-    worker_id, cpu_cores = config
-    isolated_onnx_worker_init(worker_id, cpu_cores)
-
-
-def process_pdf_in_isolated_worker(args):
-    """Process PDF in isolated worker process - this runs in separate process."""
-    pdf_content, url, metadata = args
-    
     try:
-        # Use global variables initialized in worker
+        # Set CPU affinity for this worker
+        p = psutil.Process()
+        p.cpu_affinity(cpu_cores)
+        print(f"🔧 Worker {worker_id}: Set CPU affinity to cores {cpu_cores}")
+        
+        # More aggressive resource limits per worker
+        os.environ['OMP_NUM_THREADS'] = '1'
+        os.environ['MKL_NUM_THREADS'] = '1' 
+        os.environ['OPENBLAS_NUM_THREADS'] = '1'
+        os.environ['ONNX_WORKER_ID'] = str(worker_id)
+        
+        # Set memory limits (3GB per worker to be safe)
+        import resource
+        memory_limit = 3 * 1024 * 1024 * 1024  # 3GB
+        resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
+        
+        # Worker-specific temp directory
+        worker_temp = f"/tmp/onnx_worker_{worker_id}_{os.getpid()}"
+        os.makedirs(worker_temp, exist_ok=True)
+        os.environ['TMPDIR'] = worker_temp
+        
+        # Initialize ONNX components
+        from embeddings.parsers.ONNXPDFParser import ONNXPDFParser
+        from embeddings.parsers.PDFRemoveHeaderFooter import HeaderFooterRedactor
+        from embeddings.chunker.document_chunker import DocumentChunker
+        
+        worker_id_global = worker_id
+        
+        # More conservative ONNX settings to reduce processing time
+        onnx_parser = ONNXPDFParser()
+        redactor = HeaderFooterRedactor(
+            top_k=2, bottom_k=1, win=4,  # Very conservative settings
+            header_th=0.7, footer_th=0.7, rank_th=0.6,  # Higher thresholds
+            pad=1.0, black=True,  # Reduced padding
+        )
+        chunker = DocumentChunker(max_chunk_size=1800, overlap=200)
+        
+        print(f"🔧 ONNX Worker {worker_id} initialized on cores {cpu_cores} (PID: {os.getpid()})")
+        
+    except Exception as e:
+        print(f"❌ Worker {worker_id} initialization failed: {e}")
+        raise
+
+
+def get_worker_config_for_process(all_configs):
+    """Assign worker config based on process ID to ensure uniqueness."""
+    pid = os.getpid()
+    
+    with _assignment_lock:
+        # If this process already has an assignment, return it
+        if pid in _worker_assignments:
+            return _worker_assignments[pid]
+        
+        # Find the next available worker config
+        assigned_worker_ids = {config[0] for config in _worker_assignments.values()}
+        
+        for worker_id, cpu_cores in all_configs:
+            if worker_id not in assigned_worker_ids:
+                _worker_assignments[pid] = (worker_id, cpu_cores)
+                print(f"🔧 Assigned Worker {worker_id} to Process {pid}")
+                return (worker_id, cpu_cores)
+        
+        # If all workers assigned, cycle through (shouldn't happen with proper pool size)
+        fallback_config = all_configs[len(_worker_assignments) % len(all_configs)]
+        _worker_assignments[pid] = fallback_config
+        return fallback_config
+
+
+def process_pdf_with_fixed_worker_assignment(args):
+    """Process PDF with proper per-process worker assignment."""
+    pdf_content, url, metadata, all_worker_configs = args
+    
+    # Get or assign worker config for this specific process
+    if not hasattr(process_pdf_with_fixed_worker_assignment, '_process_initialized'):
+        try:
+            # Get unique worker config for this process
+            worker_id, cpu_cores = get_worker_config_for_process(all_worker_configs)
+            
+            print(f"🔧 Process {os.getpid()} initializing as Worker {worker_id} with cores {cpu_cores}")
+            
+            # Initialize this process with the assigned config
+            isolated_onnx_worker_init(worker_id, cpu_cores)
+            
+            # Mark this process as initialized
+            process_pdf_with_fixed_worker_assignment._process_initialized = True
+            process_pdf_with_fixed_worker_assignment._worker_id = worker_id
+            
+            print(f"✅ Process {os.getpid()} successfully initialized as Worker {worker_id}")
+            
+        except Exception as e:
+            print(f"❌ Failed to initialize process {os.getpid()}: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+    
+    # Process the PDF
+    try:
         global worker_id_global, onnx_parser, redactor, chunker
+        
+        if not all([onnx_parser, redactor, chunker]):
+            print(f"❌ Process {os.getpid()}: ONNX components not available")
+            return []
         
         print(f"🟢 Worker {worker_id_global}: Processing {url[-40:]} (PID: {os.getpid()})")
         
-        # Process PDF with isolated ONNX
+        # File size check
+        if len(pdf_content) > 50 * 1024 * 1024:  # 50MB limit
+            print(f"⚠️  Worker {worker_id_global}: File too large ({len(pdf_content)/1024/1024:.1f}MB), skipping")
+            return []
+        
+        start_time = time.time()
+        
+        # Process PDF with better error handling
         import tempfile
-        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
-            tmp.write(pdf_content)
-            temp_path = tmp.name
+        import gc
+        
+        temp_path = None
+        sanitized_path = None
         
         try:
-            # Redact and parse with isolated ONNX session
-            sanitized_path = redactor.redact_to_temp(temp_path)
-            elements = onnx_parser.parse_file(sanitized_path)
+            # Write PDF to temp file
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+                tmp.write(pdf_content)
+                temp_path = tmp.name
             
-            # Chunk in the same process
+            # Clear content from memory immediately
+            del pdf_content
+            gc.collect()
+            
+            # Process with ONNX - suppress PDF warnings
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                
+                sanitized_path = redactor.redact_to_temp(temp_path)
+                elements = onnx_parser.parse_file(sanitized_path)
+            
+            # Chunk the document
             docs = chunker.chunk_document(elements, url)
             
-            # Convert to serializable format with proper metadata extraction
+            # Clear intermediate data
+            del elements
+            gc.collect()
+            
+            # Convert to serializable format
             result = []
             for doc in docs:
-                # Extract page number properly
                 pn = 0
                 try:
                     if hasattr(doc, 'metadata') and doc.metadata:
@@ -113,37 +192,33 @@ def process_pdf_in_isolated_worker(args):
                 result.append({
                     'content': doc.page_content,
                     'metadata': dict(doc.metadata) if hasattr(doc, 'metadata') and doc.metadata else {},
-                    'page_number': pn  # Pass page number separately for proper handling
+                    'page_number': pn
                 })
             
-            print(f"✅ Worker {worker_id_global}: Completed {url[-40:]} -> {len(result)} chunks")
+            processing_time = time.time() - start_time
+            print(f"✅ Worker {worker_id_global}: Completed {url[-40:]} -> {len(result)} chunks ({processing_time:.1f}s)")
             return result
             
         finally:
-            # Cleanup temp files
-            for path in [temp_path, sanitized_path if 'sanitized_path' in locals() else None]:
+            # Aggressive cleanup
+            for path in [temp_path, sanitized_path]:
                 if path and os.path.exists(path):
                     try:
                         os.unlink(path)
                     except:
                         pass
+            gc.collect()
                         
     except Exception as e:
-        print(f"❌ Worker {worker_id_global}: Error processing {url}: {e}")
+        print(f"❌ Worker {worker_id_global if 'worker_id_global' in globals() else 'Unknown'}: Error processing {url}: {e}")
+        # Don't print full traceback for PDF parsing errors
+        if "Cannot set gray non-stroke color" not in str(e):
+            import traceback
+            traceback.print_exc()
         return []
-    finally:
-        # Cleanup worker temp directory periodically
-        import random
-        if random.randint(1, 10) == 1:  # 10% chance to cleanup
-            worker_temp = f"/tmp/onnx_worker_{worker_id_global}"
-            if os.path.exists(worker_temp):
-                import shutil
-                for f in os.listdir(worker_temp):
-                    try:
-                        os.unlink(os.path.join(worker_temp, f))
-                    except:
-                        pass
 
+
+# =================== MAIN CLASSES ===================
 
 class ParallelismTracker:
     """Track parallelism across processes."""
@@ -177,123 +252,23 @@ class ParallelismTracker:
             self.total_processed += 1
             
             print(f"✅ RESULT [{current_active:2d}] {doc_url[-45:]:45s} ({duration:4.1f}s, {chunk_count} chunks) [Total: {self.total_processed}]")
-
-def get_next_worker_config(all_configs):
-    """Thread-safe round-robin worker assignment."""
-    global _next_worker_id
-    with _worker_assignment_lock:
-        config = all_configs[_next_worker_id % len(all_configs)]
-        _next_worker_id += 1
-        return config
-
-def process_pdf_with_dynamic_worker_init(args):
-    """Process PDF with dynamic worker selection - each process initializes once."""
-    pdf_content, url, metadata, all_worker_configs = args
     
-    # Check if this process is already initialized
-    if not hasattr(process_pdf_with_dynamic_worker_init, '_process_initialized'):
-        # This process hasn't been initialized yet
-        try:
-            # Get the next available worker config
-            worker_id, cpu_cores = get_next_worker_config(all_worker_configs)
-            
-            # Initialize this process with the assigned config
-            isolated_onnx_worker_init(worker_id, cpu_cores)
-            
-            # Mark this process as initialized
-            process_pdf_with_dynamic_worker_init._process_initialized = True
-            process_pdf_with_dynamic_worker_init._worker_id = worker_id
-            
-            print(f"🔧 Process {os.getpid()} initialized as Worker {worker_id}")
-            
-        except Exception as e:
-            print(f"❌ Failed to initialize process {os.getpid()}: {e}")
-            return []
-    
-    # Now use the initialized ONNX components
-    try:
-        global worker_id_global, onnx_parser, redactor, chunker
-        
-        if not all([onnx_parser, redactor, chunker]):
-            print(f"❌ Process {os.getpid()}: ONNX components not available")
-            return []
-        
-        print(f"🟢 Worker {worker_id_global}: Processing {url[-40:]} (PID: {os.getpid()})")
-        
-        # File size check
-        if len(pdf_content) > 50 * 1024 * 1024:  # 50MB limit
-            print(f"⚠️  Worker {worker_id_global}: File too large ({len(pdf_content)/1024/1024:.1f}MB), skipping")
-            return []
-        
-        # Process PDF
-        import tempfile
-        import gc
-        
-        temp_path = None
-        sanitized_path = None
-        
-        try:
-            # Write PDF to temp file
-            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
-                tmp.write(pdf_content)
-                temp_path = tmp.name
-            
-            # Clear content from memory
-            del pdf_content
-            gc.collect()
-            
-            # Process with ONNX
-            sanitized_path = redactor.redact_to_temp(temp_path)
-            elements = onnx_parser.parse_file(sanitized_path)
-            
-            # Chunk the document
-            docs = chunker.chunk_document(elements, url)
-            
-            # Clear intermediate data
-            del elements
-            gc.collect()
-            
-            # Convert to serializable format
-            result = []
-            for doc in docs:
-                pn = 0
-                try:
-                    if hasattr(doc, 'metadata') and doc.metadata:
-                        pn = int(doc.metadata.get("page_number", 0))
-                except:
-                    pn = 0
-                
-                result.append({
-                    'content': doc.page_content,
-                    'metadata': dict(doc.metadata) if hasattr(doc, 'metadata') and doc.metadata else {},
-                    'page_number': pn
-                })
-            
-            print(f"✅ Worker {worker_id_global}: Completed {url[-40:]} -> {len(result)} chunks")
-            return result
-            
-        finally:
-            # Cleanup temp files
-            for path in [temp_path, sanitized_path]:
-                if path and os.path.exists(path):
-                    try:
-                        os.unlink(path)
-                    except:
-                        pass
-            gc.collect()
-                        
-    except Exception as e:
-        print(f"❌ Worker: Error processing {url}: {e}")
-        import traceback
-        traceback.print_exc()
-        return []
+    def get_stats(self) -> Dict[str, Any]:
+        """Get final statistics."""
+        return {
+            "total_processed": self.total_processed,
+            "max_concurrent": self.max_concurrent,
+            "start_times": self.start_times,
+            "completion_times": self.completion_times
+        }
+
 
 class ProcessIsolatedONNXProcessor:
-    """Fixed multiprocessing processor."""
+    """Fixed multiprocessing processor for ONNX isolation."""
     
     def __init__(self, s3_bucket: str, session_id: Optional[str] = None, 
-                 milvus_config: Optional[Dict] = None, max_concurrent_documents: int = 15,
-                 onnx_workers: int = 6, batch_size: int = 30):  # Reduce to 6 workers
+                 milvus_config: Optional[Dict] = None, max_concurrent_documents: int = 12,
+                 onnx_workers: int = 4, batch_size: int = 20):
         self.s3_bucket = s3_bucket
         self.session_id = session_id
         self.max_concurrent_documents = max_concurrent_documents
@@ -312,12 +287,17 @@ class ProcessIsolatedONNXProcessor:
             # No initializer, no initargs - let each process initialize itself
         )
         
-        # Rest of initialization...
+        # Thread-local storage for non-PDF parsers (runs in main process)
         self._local = threading.local()
+        
+        # Shared services (main process)
         self.chunker = DocumentChunker(max_chunk_size=1800, overlap=200)
+        
+        # Thread-safe deduplication
         self.seen_hashes: set[str] = set()
         self._seen_hashes_lock = threading.Lock()
         
+        # Only error logging
         logging.basicConfig(level=logging.ERROR)
 
         if milvus_config is None:
@@ -338,8 +318,9 @@ class ProcessIsolatedONNXProcessor:
         print(f"🚀 Process-isolated processor: {max_concurrent_documents} coordinators, {onnx_workers} ONNX processes, {batch_size} batch size")
 
     def _create_worker_configs(self):
-        """Create worker configurations with CPU core assignments."""
-        cores_per_worker = 48 // self.onnx_workers
+        """Create well-separated worker configurations."""
+        # Give more cores per worker for better isolation
+        cores_per_worker = 48 // self.onnx_workers  # 12 cores per worker if 4 workers
         
         worker_configs = []
         for i in range(self.onnx_workers):
@@ -348,37 +329,11 @@ class ProcessIsolatedONNXProcessor:
             cpu_cores = list(range(start_core, min(end_core + 1, 64)))
             worker_configs.append((i, cpu_cores))
         
-        print(f"🏗️  Configured {self.onnx_workers} ONNX worker processes:")
+        print(f"🏗️  Configured {self.onnx_workers} well-isolated ONNX workers:")
         for worker_id, cores in worker_configs:
-            print(f"   Worker {worker_id}: CPU cores {cores[0]}-{cores[-1]}")
+            print(f"   Worker {worker_id}: CPU cores {cores[0]}-{cores[-1]} ({len(cores)} cores)")
         
         return worker_configs
-
-    def _create_isolated_worker_pool(self):
-        """Create pool with fewer workers to avoid memory issues."""
-        
-        # ✅ Use fewer cores per worker to reduce memory pressure
-        cores_per_worker = 48 // self.onnx_workers  # 12 cores per worker if 4 workers
-        
-        worker_configs = []
-        for i in range(self.onnx_workers):
-            start_core = 16 + (i * cores_per_worker)
-            end_core = start_core + cores_per_worker - 1
-            cpu_cores = list(range(start_core, min(end_core + 1, 64)))  # Don't exceed available cores
-            worker_configs.append((i, cpu_cores))
-        
-        print(f"🏗️  Creating {self.onnx_workers} memory-safe ONNX workers:")
-        for worker_id, cores in worker_configs:
-            print(f"   Worker {worker_id}: CPU cores {cores[0]}-{cores[-1]}")
-        
-        executor = ProcessPoolExecutor(
-            max_workers=self.onnx_workers,
-            initializer=init_worker_wrapper,
-            initargs=worker_configs
-        )
-        
-        return executor
-
 
     def _get_non_pdf_processor(self):
         """Get thread-local processor for non-PDF documents (main process)."""
@@ -389,7 +344,7 @@ class ProcessIsolatedONNXProcessor:
             ])
         return self._local.processor
 
-    # Utility methods (same as your original)
+    # Utility methods
     def get_session_metadata_files(self, session_id: str) -> List[str]:
         try:
             paginator = self.s3.get_paginator("list_objects_v2")
@@ -420,13 +375,14 @@ class ProcessIsolatedONNXProcessor:
             return b""
 
     def process_single_document(self, document_info: Tuple[dict, Dict[str, Any]]) -> List[Document]:
-        """Process single document with fixed worker assignment."""
+        """Process document with fixed worker assignment."""
         file_info, base_metadata = document_info
         
         s3_uri = file_info.get("s3_uri")
         original_url = file_info.get("url", "unknown")
         content_type = file_info.get("content_type", "application/octet-stream")
         
+        # Check if it's a PDF
         is_pdf = (original_url.lower().endswith(".pdf") or 
                  (content_type and "application/pdf" in content_type.lower()))
         
@@ -439,25 +395,27 @@ class ProcessIsolatedONNXProcessor:
                 return []
 
             if is_pdf:
+                # Use isolated ONNX worker process for PDFs
                 self.tracker.start_doc(original_url)
                 
-                # Submit to process pool with worker configs
                 try:
+                    # Submit with fixed worker assignment
                     future = self.onnx_executor.submit(
-                        process_pdf_with_dynamic_worker_init,
+                        process_pdf_with_fixed_worker_assignment,
                         (content, original_url, base_metadata, self.worker_configs)
                     )
                     
-                    # Get result with timeout
-                    serialized_docs = future.result(timeout=180)  # 3 minute timeout
+                    # Shorter timeout to prevent hanging
+                    serialized_docs = future.result(timeout=120)  # 2 minutes max per PDF
                     
                 except Exception as e:
                     print(f"❌ ONNX processing failed for {original_url}: {e}")
                     return []
                 
-                # Convert back to Document objects
+                # Convert back to Document objects with proper metadata
                 processed_docs = []
                 for doc_data in serialized_docs:
+                    # Apply proper metadata flattening
                     raw_metadata = doc_data['metadata']
                     pn = doc_data.get('page_number', 0)
                     flattened_metadata = self.flatten_metadata_for_search(base_metadata, page_number=pn)
@@ -471,13 +429,15 @@ class ProcessIsolatedONNXProcessor:
                 return processed_docs
                 
             else:
-                # Non-PDF processing
+                # Use regular processor for non-PDFs (main process)
                 self.tracker.start_doc(original_url)
                 processor = self._get_non_pdf_processor()
                 elements = processor.process(content, original_url, content_type)
                 
+                # Chunk in main process
                 chunked_docs = self.chunker.chunk_document(elements, original_url)
                 
+                # Apply metadata in main process with proper flattening
                 processed_docs = []
                 for doc in chunked_docs:
                     pn = self._extract_page_number(doc)
@@ -492,13 +452,6 @@ class ProcessIsolatedONNXProcessor:
             return []
         finally:
             self.tracker.finish_doc(original_url, len(processed_docs) if 'processed_docs' in locals() else 0)
-
-    def cleanup(self):
-        """Cleanup process pool."""
-        if hasattr(self, 'onnx_executor'):
-            self.onnx_executor.shutdown(wait=True)
-            print("🧹 Cleaned up ONNX worker processes")
-
 
     @staticmethod
     def _extract_page_number(doc: Document) -> int:
@@ -570,6 +523,26 @@ class ProcessIsolatedONNXProcessor:
         except Exception as e:
             print(f"❌ Failed to store in Milvus: {e}")
             return {"count": 0, "milvus_ids": []}
+
+    def store_documents_in_milvus_batch(self, documents: List[Document], batch_size: int = 256) -> Dict[str, Any]:
+        """Store documents in batches with proper metadata filtering."""
+        if not documents:
+            return {"count": 0, "milvus_ids": []}
+
+        total_stored = 0
+        all_ids = []
+        
+        # Process in batches to avoid memory issues
+        for i in range(0, len(documents), batch_size):
+            batch = documents[i:i + batch_size]
+            result = self.store_documents_in_milvus(batch)
+            total_stored += result.get("count", 0)
+            all_ids.extend(result.get("milvus_ids", []))
+            
+            if i % (batch_size * 4) == 0:  # Progress every 4 batches
+                print(f"📊 Stored {total_stored} documents so far...")
+        
+        return {"count": total_stored, "milvus_ids": all_ids}
 
     def stream_process_session(self, session_id: str) -> Dict[str, Any]:
         """Stream process with isolated ONNX workers."""
@@ -654,38 +627,6 @@ class ProcessIsolatedONNXProcessor:
             "max_concurrent": final_stats['max_concurrent'],
             "docs_per_minute": (final_stats['total_processed']/total_time)*60,
         }
-        
-        # Final results
-        total_time = time.time() - start_time
-        final_stats = self.tracker.get_stats()
-        
-        print(f"\n{'='*60}")
-        print(f"🎯 ISOLATED PROCESS PROCESSING COMPLETE!")
-        print(f"   ONNX worker processes: {self.onnx_workers}")
-        print(f"   Total documents: {final_stats['total_processed']}")
-        print(f"   Max concurrent: {final_stats['max_concurrent']}")
-        print(f"   Final rate: {(final_stats['total_processed']/total_time)*60:.1f} docs/min")
-        print(f"{'='*60}")
-        
-    def store_documents_in_milvus_batch(self, documents: List[Document], batch_size: int = 256) -> Dict[str, Any]:
-        """Store documents in batches with proper metadata filtering."""
-        if not documents:
-            return {"count": 0, "milvus_ids": []}
-
-        total_stored = 0
-        all_ids = []
-        
-        # Process in batches to avoid memory issues
-        for i in range(0, len(documents), batch_size):
-            batch = documents[i:i + batch_size]
-            result = self.store_documents_in_milvus(batch)
-            total_stored += result.get("count", 0)
-            all_ids.extend(result.get("milvus_ids", []))
-            
-            if i % (batch_size * 4) == 0:  # Progress every 4 batches
-                print(f"📊 Stored {total_stored} documents so far...")
-        
-        return {"count": total_stored, "milvus_ids": all_ids}
 
     def cleanup(self):
         """Cleanup isolated worker processes."""
@@ -693,13 +634,12 @@ class ProcessIsolatedONNXProcessor:
             self.onnx_executor.shutdown(wait=True)
             print("🧹 Cleaned up isolated ONNX worker processes")
 
-
     def flatten_metadata_for_search(self, metadata: dict, page_number: int | None = None) -> dict:
         """Flatten metadata for search with proper field handling."""
         md = {
             "url": self._clamp(metadata.get("url", ""), 1000),
             "title": self._clamp(metadata.get("title", ""), 1000),
-            "subtitle": self._clamp(metadata.get("subtitle", ""), 100),
+            "subtitle": self._clamp(metadata.get("subtitle", ""), 500),
             "document_type": self._clamp(metadata.get("document_type", ""), 100),
             "document_number": self._clamp(metadata.get("document_number", ""), 100),
             "publication_date": self._clamp(metadata.get("publication_date") or "", 50),
@@ -772,15 +712,6 @@ class ProcessIsolatedONNXProcessor:
         url_hash = hashlib.sha256(doc.metadata.get("url", "").encode()).hexdigest()
         return hashlib.sha256((content_hash + url_hash).encode()).hexdigest()
 
-    def get_stats(self) -> Dict[str, Any]:
-        """Get final statistics - this should be added to ParallelismTracker class."""
-        return {
-            "total_processed": self.total_processed,
-            "max_concurrent": self.max_concurrent,
-            "start_times": self.start_times,
-            "completion_times": self.completion_times
-        }
-
 
 def main():
     # IMPORTANT: This is required for multiprocessing on some systems
@@ -794,13 +725,13 @@ def main():
         "connection_args": {"host": "54.217.166.223", "port": "19530"},
     }
 
-    # Create processor with isolated ONNX workers
+    # Create processor with conservative settings for stability
     processor = ProcessIsolatedONNXProcessor(
         s3_bucket=S3_BUCKET,
         milvus_config=MILVUS_CONFIG,
-        max_concurrent_documents=15,  # Main process coordination threads
-        onnx_workers=8,              # Isolated ONNX worker processes
-        batch_size=30
+        max_concurrent_documents=12,  # Reduced from 15
+        onnx_workers=4,              # Reduced from 8
+        batch_size=20                # Reduced from 30
     )
 
     try:
