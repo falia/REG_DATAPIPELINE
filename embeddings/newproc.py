@@ -89,31 +89,6 @@ def _parse_s3_uri(s3_uri: str) -> Tuple[str, str]:
         return u.netloc, u.path.lstrip("/")
     return "", s3_uri
 
-# ---------- content-hash cache helpers ----------
-_EXT_MAP = {
-    "application/pdf": ".pdf",
-    "text/html": ".html",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
-    "application/msword": ".doc",
-    "application/vnd.ms-excel": ".xls",
-    "text/plain": ".txt",
-}
-
-def _ext_from_content_type(ct: str) -> str:
-    ct = (ct or "").split(";")[0].strip().lower()
-    return _EXT_MAP.get(ct, "")
-
-def _cache_rel_from_content_hash(content_hash: str, ext: str = "") -> Optional[str]:
-    """
-    Build a short, sharded path from a content hash, e.g.:
-      e58d5954... -> e5/8d/e58d5954abf7ea002f...<ext>
-    """
-    h = (content_hash or "").strip().lower()
-    if not h or len(h) < 8:
-        return None
-    return os.path.join(h[:2], h[2:4], f"{h}{ext}")
-
 class S3MetadataProcessor:
     def __init__(
         self,
@@ -146,7 +121,14 @@ class S3MetadataProcessor:
             use_threads=True,
         )
 
+        # ---- Parser wiring ----
+        # Use a shared, lightweight HTML processor
         self.html_processor = DocumentProcessor(parsers=[EurlexHTMLParser(), CSSFHTMLParser()])
+        # PDF parser is NOT shared; created per-thread (thread-local) to avoid cross-thread state.
+        self._tls = threading.local()
+        self.pdf_max_concurrency = int(os.getenv("CSSF_PDF_CONCURRENCY", "16"))
+        self._pdf_slots = threading.Semaphore(self.pdf_max_concurrency)
+
         self.chunker = DocumentChunker(max_chunk_size=1800, overlap=200)
 
         # dedupe structures (thread-safe)
@@ -175,7 +157,7 @@ class S3MetadataProcessor:
         self.min_free_bytes = int(float(os.getenv("CSSF_MIN_FREE_MB", "8192")) * 1024 * 1024)     # 8 GB floor
         self.max_cache_bytes = int(float(os.getenv("CSSF_MAX_CACHE_GB", "200")) * 1024 * 1024 * 1024)  # 200 GB
 
-        # progress handle (set in stream_session/stream_local)
+        # progress handle (set in stream_session)
         self._progress: Optional[Progress] = None
 
     # ---------------- util ----------------
@@ -300,50 +282,29 @@ class S3MetadataProcessor:
         base = os.path.basename(key) or (os.path.basename(local_path) if local_path else "")
         return base or "document"
 
+    # ---------------- parsing helpers (HTML vs PDF) ----------------
+
+    def _is_pdf_type(self, content_type: str, original_url: str, local_path: str) -> bool:
+        ct = (content_type or "").lower()
+        if "pdf" in ct:
+            return True
+        p = (original_url or local_path or "").lower()
+        return p.endswith(".pdf")
+
+    def _get_thread_pdf_parser(self) -> PDFParserPipeline:
+        """Create/reuse a PDF parser per-thread to avoid cross-thread sharing."""
+        if not hasattr(self._tls, "pdf_parser"):
+            self._tls.pdf_parser = PDFParserPipeline()
+        return self._tls.pdf_parser
+
+    def _parse_to_elements(self, content: bytes, original_url: str, content_type: str, is_pdf: bool):
+        if is_pdf:
+            parser = self._get_thread_pdf_parser()
+            return parser.process(content, original_url, "application/pdf")
+        # Non-PDF: shared HTML-capable processor
+        return self.html_processor.process(content, original_url, content_type)
+
     # ---------------- streaming pipeline helpers ----------------
-
-    def _download_one(self, bucket: str, key: str, dst_path: str, original_url: Optional[str]) -> Tuple[str, bool]:
-        """Download a single S3 object to dst_path. Returns (dst_path, did_download)."""
-        _ensure_dir(os.path.dirname(dst_path))
-        if os.path.exists(dst_path) and os.path.getsize(dst_path) > 0:
-            return (dst_path, False)
-
-        expected = 64 * 1024 * 1024
-        try:
-            head = self.s3.head_object(Bucket=bucket, Key=key)
-            expected = int(head.get("ContentLength") or expected)
-        except Exception:
-            pass
-
-        self._ensure_space_for(expected)
-
-        try:
-            dst_for_api = _win_long_path(dst_path)
-            self.s3.download_file(
-                Bucket=bucket,
-                Key=key,
-                Filename=dst_for_api,
-                Config=self.transfer_config,
-            )
-            return (dst_path, True)
-        except OSError as oe:
-            if getattr(oe, "errno", None) == errno.ENOSPC:
-                self._evict_cache(self.min_free_bytes + expected)
-                try:
-                    dst_for_api = _win_long_path(dst_path)
-                    self.s3.download_file(
-                        Bucket=bucket,
-                        Key=key,
-                        Filename=dst_for_api,
-                        Config=self.transfer_config,
-                    )
-                    return (dst_path, True)
-                except Exception:
-                    return (dst_path, False)
-            else:
-                return (dst_path, False)
-        except Exception:
-            return (dst_path, False)
 
     def _process_one_file(self, metadata: Dict[str, Any], original_url: str, content_type: str, local_path: str) -> List[Document]:
         """Parse one local file and return chunked Documents with flattened metadata. Prints content type."""
@@ -355,7 +316,15 @@ class S3MetadataProcessor:
             print(f"Processed: {fname} [{ct}]")
             return []
 
-        elements = self.processor.process(content, original_url, content_type)
+        is_pdf = self._is_pdf_type(ct, original_url, local_path)
+
+        # PDF parsing is throttled to avoid choking other workers
+        if is_pdf:
+            with self._pdf_slots:
+                elements = self._parse_to_elements(content, original_url, ct, is_pdf=True)
+        else:
+            elements = self._parse_to_elements(content, original_url, ct, is_pdf=False)
+
         chunked_docs = self.chunker.chunk_document(elements, original_url)
 
         out_docs: List[Document] = []
@@ -469,6 +438,7 @@ class S3MetadataProcessor:
 
                 if len(batch) >= self.batch_store_size:
                     cnt, ids = self._flush_batch(batch)
+                    # progress: stored docs
                     if self._progress:
                         self._progress.inc_stored(cnt)
                     total_count += cnt
@@ -494,219 +464,7 @@ class S3MetadataProcessor:
         except Exception:
             return (0, [])
 
-    # ---------------- LOCAL MODE ----------------
-
-    def _content_type_from_name(self, name: str, default="application/octet-stream") -> str:
-        ct, _ = mimetypes.guess_type(name)
-        if not ct and name.lower().endswith(".pdf"):
-            ct = "application/pdf"
-        return ct or default
-
-    def _build_local_jobs(self, local_root: str) -> List[Tuple[Dict[str, Any], Dict[str, Any], str]]:
-        """
-        Create (metadata, file_info, local_path) tuples to process, using:
-          - metadata.json under local_root
-          - content files from self.local_cache_dir/objects/<hash-sharded path>
-        Fallbacks: try exact local_root/<key> and legacy key-hash cache path.
-        """
-        jobs: List[Tuple[Dict[str, Any], Dict[str, Any], str]] = []
-        found_metadata = False
-
-        for dp, _, files in os.walk(local_root):
-            for f in files:
-                if f != "metadata.json":
-                    continue
-                found_metadata = True
-                md_path = os.path.join(dp, f)
-                try:
-                    with open(md_path, "r", encoding="utf-8") as fh:
-                        md = json.load(fh) or {}
-                    md["crawl_session"] = self.session_id or os.path.basename(os.path.normpath(local_root))
-
-                    for fi in md.get("top_related", []):
-                        s3_uri = (fi.get("s3_uri") or "").strip()
-                        if not s3_uri:
-                            continue
-
-                        ch = (fi.get("content_hash") or md.get("content_hash") or "").strip()
-                        ct = (fi.get("content_type") or "").strip()
-                        ext = _ext_from_content_type(ct)
-                        lp: Optional[str] = None
-
-                        # 1) Try hash-addressed cache path
-                        if ch:
-                            rel = _cache_rel_from_content_hash(ch, ext)
-                            if rel:
-                                p = os.path.join(self.local_cache_dir, "objects", rel)
-                                if os.path.exists(p):
-                                    lp = p
-
-                        # 2) Try exact S3-key mirror under local_root
-                        if not lp:
-                            _b, key = _parse_s3_uri(s3_uri)
-                            if key:
-                                p2 = os.path.join(local_root, key)
-                                if os.path.exists(p2):
-                                    lp = p2
-
-                        # 3) Fallback to legacy safe cache path (by key)
-                        if not lp:
-                            _b, key = _parse_s3_uri(s3_uri)
-                            if key:
-                                alt = os.path.join(self.local_cache_dir, "objects", _safe_local_rel_from_key(key))
-                                if os.path.exists(alt):
-                                    lp = alt
-
-                        if lp:
-                            if not fi.get("content_type"):
-                                fi["content_type"] = ct or self._content_type_from_name(lp)
-                            jobs.append((md, fi, lp))
-                except Exception:
-                    pass
-
-        if not found_metadata:
-            # No metadata.json → process all files directly under local_root (minimal metadata)
-            sess = self.session_id or os.path.basename(os.path.normpath(local_root))
-            for dp, _, files in os.walk(local_root):
-                for f in files:
-                    if f.lower().endswith("metadata.json"):
-                        continue
-                    lp = os.path.join(dp, f)
-                    if not os.path.isfile(lp):
-                        continue
-                    ct = self._content_type_from_name(f)
-                    md = {
-                        "url": f, "title": f, "subtitle": "",
-                        "document_type": "", "document_number": "",
-                        "publication_date": "", "update_date": "",
-                        "content_hash": "", "crawl_timestamp": "",
-                        "file_size": os.path.getsize(lp),
-                        "lang": "", "super_category": "", "crawl_session": sess,
-                        "top_related": [], "bottom_related": [], "themes": [],
-                        "entities": [], "keywords": [],
-                    }
-                    fi = {"url": f, "content_type": ct}
-                    jobs.append((md, fi, lp))
-
-        return jobs
-
-    def stream_local(self, local_root: str) -> Dict[str, Any]:
-        """Process a pre-synced local tree (no S3 calls)."""
-        jobs = self._build_local_jobs(local_root)
-        if not jobs:
-            print(f"Nothing to process under {local_root}")
-            return {"session_id": self.session_id or os.path.basename(os.path.normpath(local_root)),
-                    "processed": 0, "stored": 0, "errors": 0}
-
-        # progress + heartbeat
-        progress = Progress(total_files=len(jobs))
-        self._progress = progress
-        hb_stop = threading.Event()
-        hb_interval = float(os.getenv("CSSF_PROGRESS_EVERY", "5"))
-
-        proc_q: Queue = Queue(maxsize=int(os.getenv("CSSF_PIPELINE_QUEUE", "200")))
-        docs_q: Queue = Queue(maxsize=int(os.getenv("CSSF_DOCS_QUEUE", "1000")))
-
-        def heartbeat():
-            if os.getenv("CSSF_PROGRESS", "1") == "0":
-                return
-            while not hb_stop.wait(hb_interval):
-                snap = progress.snapshot()
-                try:
-                    qproc = proc_q.qsize()
-                except Exception:
-                    qproc = -1
-                try:
-                    qdocs = docs_q.qsize()
-                except Exception:
-                    qdocs = -1
-                print(
-                    "[PROG] dl {dl}/{tot} ({pdl:.1f}%) | proc {pr}/{tot} ({ppr:.1f}%) | stored_docs {sd} "
-                    "| rate {r:.2f} f/s | ETA ~ {eta:.0f}s | q:proc={qproc} docs={qdocs}"
-                    .format(dl=snap["downloaded"], pr=snap["processed"], sd=snap["stored_docs"], tot=snap["total"],
-                            pdl=snap["pct_dl"], ppr=snap["pct_pr"], r=snap["rate_fps"], eta=snap["eta_sec"],
-                            qproc=qproc, qdocs=qdocs)
-                )
-
-        hb = threading.Thread(target=heartbeat, name="PROG", daemon=True)
-        hb.start()
-
-        # writers (allow parallel writers)
-        WRITERS = int(os.getenv("CSSF_WRITER_THREADS", "1"))
-        writer_results = []
-        writer_lock = threading.Lock()
-
-        def writer_worker():  # ← NO args
-            try:
-                res = self.store_documents_in_milvus_streaming(docs_q)
-                with writer_lock:
-                    writer_results.append(res)
-            except Exception as e:
-                print(f"[{threading.current_thread().name}] writer error: {e}", file=sys.stderr)
-
-        writers = []
-        for i in range(WRITERS):
-            t = threading.Thread(target=writer_worker, name=f"WRITER-{i+1}", daemon=True)
-            t.start()  # ← start it
-            writers.append(t)
-
-        # processors
-        def processor_worker():
-            while True:
-                item = proc_q.get()
-                if item is None:
-                    proc_q.task_done()
-                    break
-                md, fi, local_path = item
-                original_url = fi.get("url") or os.path.basename(local_path)
-                ct = fi.get("content_type") or self._content_type_from_name(local_path)
-                try:
-                    docs = self._process_one_file(md, original_url, ct, local_path)
-                    if docs:
-                        docs_q.put(docs)
-                except Exception:
-                    pass
-                finally:
-                    progress.inc_processed(1)
-                    proc_q.task_done()
-
-        processors = []
-        MAX_WORKERS = int(os.getenv("CSSF_MAX_WORKERS", "64"))
-        for i in range(MAX_WORKERS):
-            t = threading.Thread(target=processor_worker, name=f"PROC-{i+1:02d}", daemon=True)
-            t.start()  # ← this was missing in one earlier version
-            processors.append(t)
-
-        # enqueue all jobs (mark as "downloaded")
-        for job in jobs:
-            proc_q.put(job)
-            progress.inc_downloaded(1)
-
-        # drain processors
-        proc_q.join()
-        for _ in processors:
-            proc_q.put(None)
-        for t in processors:
-            t.join()
-
-        # stop writers
-        for _ in writers:
-            docs_q.put(None)
-        for t in writers:
-            t.join()
-
-        hb_stop.set()
-        hb.join(timeout=1)
-
-        total_stored = sum((r or {}).get("count", 0) for r in writer_results)
-        return {
-            "session_id": self.session_id or os.path.basename(os.path.normpath(local_root)),
-            "processed": total_stored,
-            "stored": total_stored,
-            "errors": 0,
-        }
-
-    # ---------------- STREAMING SESSION (S3) ----------------
+    # ---------------- STREAMING SESSION ORCHESTRATION ----------------
 
     def stream_session(self, session_id: str) -> Dict[str, Any]:
         """Concurrent download → process → store pipeline with proper backpressure + progress tracker."""
@@ -733,14 +491,7 @@ class S3MetadataProcessor:
                 b, k = _parse_s3_uri(s3_uri)
                 if not b:
                     b = self.s3_bucket
-
-                # Prefer content_hash-based cache path for local storage
-                ch = (fi.get("content_hash") or md.get("content_hash") or "").strip()
-                ct = fi.get("content_type", "")
-                ext = _ext_from_content_type(ct)
-                rel_by_hash = _cache_rel_from_content_hash(ch, ext) if ch else None
-                local_rel = rel_by_hash or _safe_local_rel_from_key(k)
-
+                local_rel = _safe_local_rel_from_key(k)
                 local_path = os.path.join(self.local_cache_dir, "objects", local_rel)
                 download_jobs.append((b, k, local_path, md, fi))
 
@@ -796,13 +547,20 @@ class S3MetadataProcessor:
                         guess = "application/pdf"
                     ct = guess or "application/octet-stream"
                 try:
-                    docs = self._process_one_file(md, original_url, ct, local_path)
+                    # Route to PDF/non-PDF paths; PDF path is semaphore-limited.
+                    is_pdf = self._is_pdf_type(ct, original_url, local_path)
+                    if is_pdf:
+                        with self._pdf_slots:
+                            docs = self._process_one_file(md, original_url, "application/pdf", local_path)
+                    else:
+                        docs = self._process_one_file(md, original_url, ct, local_path)
+
                     if docs:
                         docs_q.put(docs)
                 except Exception:
                     pass
                 finally:
-                    progress.inc_processed(1)  # file processed (even if 0 chunks)
+                    progress.inc_processed(1)  # ✅ file processed (even if 0 chunks)
                     proc_q.task_done()
 
         processors = []
@@ -821,7 +579,7 @@ class S3MetadataProcessor:
                 pass
             if os.path.exists(lp) and os.path.getsize(lp) > 0:
                 proc_q.put((md, fi, lp))
-                progress.inc_downloaded(1)
+                progress.inc_downloaded(1)  # ✅ ready for processing
 
         with ThreadPoolExecutor(max_workers=self.download_max_workers, thread_name_prefix="DL") as dl_ex:
             futures = [dl_ex.submit(downloader_task, job) for job in download_jobs]
@@ -861,14 +619,56 @@ class S3MetadataProcessor:
     def process_session(self, session_id: str) -> Dict[str, Any]:
         return self.stream_session(session_id)
 
+    # ---------------- download helper ----------------
+
+    def _download_one(self, bucket: str, key: str, dst_path: str, original_url: Optional[str]) -> Tuple[str, bool]:
+        """Download a single S3 object to dst_path. Returns (dst_path, did_download). Prints only when downloaded."""
+        _ensure_dir(os.path.dirname(dst_path))
+        if os.path.exists(dst_path) and os.path.getsize(dst_path) > 0:
+            return (dst_path, False)
+
+        expected = 64 * 1024 * 1024
+        try:
+            head = self.s3.head_object(Bucket=bucket, Key=key)
+            expected = int(head.get("ContentLength") or expected)
+        except Exception:
+            pass
+
+        self._ensure_space_for(expected)
+
+        try:
+            dst_for_api = _win_long_path(dst_path)
+            self.s3.download_file(
+                Bucket=bucket,
+                Key=key,
+                Filename=dst_for_api,
+                Config=self.transfer_config,
+            )
+            return (dst_path, True)
+        except OSError as oe:
+            if getattr(oe, "errno", None) == errno.ENOSPC:
+                self._evict_cache(self.min_free_bytes + expected)
+                try:
+                    dst_for_api = _win_long_path(dst_path)
+                    self.s3.download_file(
+                        Bucket=bucket,
+                        Key=key,
+                        Filename=dst_for_api,
+                        Config=self.transfer_config,
+                    )
+                    print(f"Downloaded: {self._filename_from_url_or_key(original_url, key, dst_path)}")
+                    return (dst_path, True)
+                except Exception:
+                    return (dst_path, False)
+            else:
+                return (dst_path, False)
+        except Exception:
+            return (dst_path, False)
+
 def main():
     S3_BUCKET = os.getenv("CSSF_S3_BUCKET", "cssf-crawl")
     SESSION_ID = os.getenv("CSSF_SESSION_ID")
     REGION = os.getenv("AWS_REGION", "eu-west-1")
-
-    # Local mirror mode toggle
-    LOCAL_ROOT = os.getenv("CSSF_LOCAL_ROOT")                   # if set → run locally (no S3)
-    LOCAL_CACHE = os.getenv("CSSF_LOCAL_CACHE", "./_cache/cssf_session")
 
     # m7i.16xlarge tuned defaults (env-overridable)
     DL_WORKERS = int(os.getenv("CSSF_DL_WORKERS", "192"))            # files in parallel (downloader)
@@ -876,6 +676,7 @@ def main():
     CHUNK_MB = int(os.getenv("CSSF_CHUNK_MB", "64"))                 # multipart chunk size
     TRANSFER_THREADS = int(os.getenv("CSSF_TRANSFER_THREADS", "8"))  # threads per file (multipart)
     BATCH_STORE = int(os.getenv("CSSF_BATCH_STORE", "1024"))         # embeddings batch
+    LOCAL_CACHE = os.getenv("CSSF_LOCAL_CACHE", "./_cache/cssf_session")
 
     # queue sizes
     os.environ.setdefault("CSSF_PIPELINE_QUEUE", "100")
@@ -889,10 +690,13 @@ def main():
     os.environ.setdefault("CSSF_MIN_FREE_MB", "8192")
     os.environ.setdefault("CSSF_MAX_CACHE_GB", "200")
 
+    # NEW: cap PDF concurrency (defaults to 4)
+    os.environ.setdefault("CSSF_PDF_CONCURRENCY", "4")
+
     MILVUS_CONFIG = {
         "host": "54.217.166.223",
         "port": "19530",
-        "collection_name": "cssf_documents_final_final_CGDEMO45",
+        "collection_name": "cssf_documents_final_final_CGDEMO41",
         "connection_args": {"host": "54.217.166.223", "port": "19530"},
     }
 
@@ -909,13 +713,6 @@ def main():
         transfer_threads_per_download=TRANSFER_THREADS,
     )
 
-    # Prefer local mirror if provided
-    if LOCAL_ROOT:
-        res = processor.stream_local(LOCAL_ROOT)
-        print("Local processing complete:", res)
-        return
-
-    # else S3 session
     target_session = SESSION_ID or processor.get_most_recent_session()
     if target_session:
         processor.stream_session(target_session)
