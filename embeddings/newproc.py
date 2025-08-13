@@ -146,7 +146,7 @@ class S3MetadataProcessor:
             use_threads=True,
         )
 
-        self.processor = DocumentProcessor(parsers=[EurlexHTMLParser(), CSSFHTMLParser(), PDFParserPipeline()])
+        self.html_processor = DocumentProcessor(parsers=[EurlexHTMLParser(), CSSFHTMLParser()])
         self.chunker = DocumentChunker(max_chunk_size=1800, overlap=200)
 
         # dedupe structures (thread-safe)
